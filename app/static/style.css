@@ -7,3 +7,18 @@ html{font-size:15px;-webkit-text-size-adjust:100%}body{font-family:Inter,ui-sans
 @media(max-width:360px){.cards{grid-template-columns:1fr 1fr}.stat{padding:10px}.stat strong{font-size:14px}.header-mark{display:none}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{transition:none!important;scroll-behavior:auto!important}}
 .transaction-form{display:block}.transaction-form .grid{margin-bottom:18px}.item-table{min-width:680px}.item-table input,.item-table select{min-width:85px;width:100%;padding:9px}.item-table td{vertical-align:middle}.item-table td:first-child{min-width:210px}.invoice-total{display:flex;justify-content:flex-end;gap:12px;margin:18px 0;font-size:1.15rem}.invoice-total strong{color:var(--primary,#086b44)}.transaction-form .add-line{margin:10px 0}.transaction-form details{max-width:100%}form.transaction-form .scroll{max-width:100%}@media(max-width:680px){.item-table{min-width:680px}.transaction-form .grid{grid-template-columns:1fr}.invoice-total{font-size:1rem}.card{max-width:100%;min-width:0}.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}main{min-width:0}}
+
+/* v0.4: modern software navigation with compact icon tiles */
+.sidebar{background:linear-gradient(175deg,#053e2c 0%,#092d2c 65%,#102b34 100%);padding:16px 12px 28px}
+.sidebar .brand{margin-bottom:16px}.sidebar .nav-home,.sidebar .nav-group>summary{display:flex;align-items:center;gap:11px;border-radius:11px;min-height:46px;padding:9px 11px;font-weight:650;color:#e8fff2;font-size:13px;list-style:none}
+.sidebar .nav-group>summary::-webkit-details-marker{display:none}
+.sidebar .nav-group{margin:5px 0}.sidebar .nav-group[open]>summary{background:#ffffff14}
+.nav-ico{width:30px;height:30px;min-width:30px;display:inline-flex;align-items:center;justify-content:center;background:#ffffff16;color:#d7ffde;border:1px solid #ffffff18;border-radius:9px;font-size:18px;font-weight:600;line-height:1}
+.nav-chevron{margin-left:auto;font-size:18px;color:#8acbb1}.nav-items{padding:5px 0 9px 11px;display:grid;gap:3px}
+.sidebar .nav-sub{display:flex;align-items:center;gap:9px;min-height:40px;padding:5px 8px 5px 9px;border-radius:9px;color:#c8e5d8;font-size:12px;line-height:1.3}
+.sidebar .nav-subico{width:28px;min-width:28px;height:28px;border-radius:8px;background:#ffffff0e;color:#94e5b4;font-size:15px}
+.sidebar .nav-sub:hover,.sidebar .nav-sub.active{background:#ffffff20;color:white}
+.sidebar .nav-sub.active .nav-subico{background:#f47718;color:white;border-color:#f47718}
+.print-links{display:flex;flex-wrap:wrap;gap:7px}.print-link{display:inline-flex;align-items:center;padding:8px 10px;border-radius:8px;border:1px solid #a4d7bd;background:#e9f8ee;color:#0a6242;font-weight:700;font-size:12px;white-space:nowrap}
+.print-link:hover{background:#c9f1da}.sidebar a{transition:background .16s ease}
+@media(max-width:900px){.sidebar{width:min(310px,88vw)}.sidebar .nav-group>summary{min-height:48px}.sidebar .nav-sub{min-height:44px}}

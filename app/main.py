@@ -3,7 +3,7 @@ from datetime import datetime, date
 from decimal import Decimal, ROUND_HALF_UP
 from contextlib import contextmanager
 from fastapi import FastAPI, Request, Depends, Form, HTTPException
-from fastapi.responses import RedirectResponse, StreamingResponse, Response
+from fastapi.responses import RedirectResponse, StreamingResponse, Response, HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
@@ -13,6 +13,8 @@ from argon2 import PasswordHasher
 from openpyxl import Workbook
 from reportlab.pdfgen.canvas import Canvas
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import simpleSplit
+from html import escape
 
 D=Decimal
 ZERO=D('0.00')
@@ -37,9 +39,17 @@ class Journal(Base):
 class Stock(Base):
  __tablename__='stocks';id=Column(Integer,primary_key=True);company_id=Column(Integer,index=True);doc_id=Column(Integer,ForeignKey('documents.id'),index=True);date=Column(String(10));item_id=Column(Integer);warehouse_id=Column(Integer);qty=Column(Numeric(18,4),default=0);value=Column(Numeric(18,2),default=0);unit_cost=Column(Numeric(18,4),default=0)
 Base.metadata.create_all(engine)
-app=FastAPI(title='aciscounting.id',version='0.3.0')
+app=FastAPI(title='aciscounting.id',version='0.4.0')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SECRET_KEY','DEV_ONLY_CHANGE_THIS_SECRET'),https_only=os.getenv('COOKIE_SECURE','false').lower()=='true',same_site='lax')
 ROOT=os.path.dirname(__file__);tplfilter=lambda v: json.loads(v or '{}');app.mount('/static',StaticFiles(directory=ROOT+'/static'),name='static');tpl=Jinja2Templates(directory=ROOT+'/templates');tpl.env.filters['from_json']=tplfilter
+@app.exception_handler(HTTPException)
+async def friendly_error(req:Request,exc:HTTPException):
+ if req.url.path.startswith('/health') or 'application/json' in req.headers.get('accept',''):
+  return Response(content=json.dumps({'detail':str(exc.detail)}),status_code=exc.status_code,media_type='application/json')
+ message=escape(str(exc.detail))
+ back=escape(req.headers.get('referer','/'),quote=True)
+ return HTMLResponse(f'''<!doctype html><html lang="id"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Informasi Transaksi</title><style>body{{font-family:system-ui;background:#f2f8f4;color:#18392d;padding:30px}}.box{{background:white;border-radius:16px;padding:28px;max-width:540px;margin:9vh auto;box-shadow:0 12px 35px #1232}}a{{display:inline-block;padding:12px 18px;background:#0c8052;color:white;border-radius:9px;text-decoration:none}}</style><div class="box"><h2>Transaksi belum dapat diproses</h2><p>{message}</p><p>Periksa data atau pengaturan COA, lalu coba kembali.</p><a href="{back}">Kembali ke aplikasi</a></div></html>''',status_code=exc.status_code)
+
 @app.get('/health')
 def health():return {'status':'ok'}
 def db():
@@ -60,16 +70,34 @@ def page(req,s,title,**ctx):
  return tpl.TemplateResponse('app.html',{'request':req,'title':title,'user':u,'company':c,'cash':cash,'today':date.today().isoformat(),**ctx})
 ACCOUNTS=[('1000','Kas','asset'),('1010','Bank','asset'),('1100','Piutang Usaha','asset'),('1200','Persediaan','asset'),('1500','Aset Tetap','asset'),('1590','Akumulasi Penyusutan','contra_asset'),('2000','Hutang Usaha','liability'),('3000','Modal','equity'),('4000','Penjualan','income'),('4010','Retur Penjualan','contra_income'),('5000','HPP','expense'),('6000','Beban Operasional','expense'),('6100','Beban Penyusutan','expense'),('1201','Selisih Persediaan','expense'),('1150','PPN Masukan','asset'),('2100','PPN Keluaran','liability')]
 def seed(s,cid):
- for code,name,typ in ACCOUNTS:s.add(Master(company_id=cid,kind='coa',code=code,name=name,extra=json.dumps({'type':typ})))
+ for code,name,typ in ACCOUNTS:s.add(Master(company_id=cid,kind='coa',code=code,name=name,extra=json.dumps({'type':typ,'system_code':code})))
  s.add(Master(company_id=cid,kind='warehouse',code='GD-01',name='Gudang Utama'))
 def master(s,cid,kind,mid):
  x=owned(s,Master,mid,cid)
  if x.kind!=kind:raise HTTPException(400,'Jenis master tidak sesuai')
  return x
+SYSTEM_CODES={c:(n,t) for c,n,t in ACCOUNTS}
+def system_code(x):
+ e=json.loads(x.extra or '{}')
+ return e.get('system_code') or x.code
+
+def ensure_system_coas(s,cid):
+ # Safe idempotent migration for older companies; do not replace renamed system accounts.
+ existing=s.query(Master).filter_by(company_id=cid,kind='coa').all()
+ aliases={system_code(x) for x in existing}
+ for code,(name,typ) in SYSTEM_CODES.items():
+  if code not in aliases:
+   if any(x.code==code for x in existing):
+    raise HTTPException(400,f'Kode akun {code} sudah dipakai akun lain; periksa COA')
+   x=Master(company_id=cid,kind='coa',code=code,name=name,extra=json.dumps({'type':typ,'system_code':code}))
+   s.add(x);existing.append(x)
+ s.flush()
+
 def coa(s,cid,code):
- x=s.query(Master).filter_by(company_id=cid,kind='coa',code=code).first()
- if not x:raise HTTPException(400,f'COA {code} tidak ditemukan')
- return x.id
+ ensure_system_coas(s,cid)
+ for x in s.query(Master).filter_by(company_id=cid,kind='coa').all():
+  if x.code==code or system_code(x)==code:return x.id
+ raise HTTPException(400,f'Akun {code} belum tersedia')
 def lines(s,doc,entries):
  debit=sum((dec(x[1]) for x in entries),ZERO);credit=sum((dec(x[2]) for x in entries),ZERO)
  if debit!=credit:raise HTTPException(400,f'Jurnal tidak seimbang: {debit} / {credit}')
@@ -94,6 +122,7 @@ def stockout(s,doc,item,warehouse,qty):
 
 def post(s,doc):
  if doc.status!='draft':raise HTTPException(400,'Hanya draft yang dapat diposting')
+ ensure_system_coas(s,doc.company_id)
  c=owned(s,Company,doc.company_id,doc.company_id) if False else s.get(Company,doc.company_id)
  if c.locked_through and doc.date<=c.locked_through:raise HTTPException(400,'Periode sudah dikunci')
  # Block backdated stock transactions to keep moving-average costs stable.
@@ -164,14 +193,6 @@ def post(s,doc):
    elif difference<0:E.append(('1201',-difference,0))
  elif k=='sale_receipt':E=[(p.get('bank','1010'),amount,0),('1100',0,amount)]
  elif k=='purchase_payment':E=[('2000',amount,0),(p.get('bank','1010'),0,amount)]
- elif k=='sale_return':
-  if qty<=0 or amount<=0:raise HTTPException(400,'Qty dan nominal harus positif')
-  # Return cost supplied as original invoice cost, not current average.
-  cost=dec(p.get('cost',0));move(s,doc,item,wh,qty,cost);E=[('4010',amount,0),('1100',0,amount),('1200',cost,0),('5000',0,cost)]
- elif k=='purchase_return':
-  cost=stockout(s,doc,item,wh,qty);E=[('2000',amount,0),('1200',0,cost)]
-  if amount>cost:E.append(('1201',0,amount-cost))
-  elif cost>amount:E.append(('1201',cost-amount,0))
  elif k=='transfer':
   dst=int(p.get('to_warehouse') or 0)
   if dst==wh:raise HTTPException(400,'Gudang asal dan tujuan harus berbeda')
@@ -197,7 +218,7 @@ MASTER_KINDS={'coa':'COA','customer':'Pelanggan','supplier':'Pemasok','item':'Ba
 def home(req:Request,s=Depends(db)):
  try:u=user(req,s)
  except HTTPException:return go('/login')
- cid=u.company_id;docs=s.query(Document).filter_by(company_id=cid,status='posted').all();j=s.query(Journal).filter_by(company_id=cid).all();am={x.id:x.code for x in s.query(Master).filter_by(company_id=cid,kind='coa')}
+ cid=u.company_id;docs=s.query(Document).filter_by(company_id=cid,status='posted').all();j=s.query(Journal).filter_by(company_id=cid).all();am={x.id:system_code(x) for x in s.query(Master).filter_by(company_id=cid,kind='coa')}
  def sumcode(code,side):return sum((D(getattr(x,side) or 0) for x in j if am.get(x.account_id)==code),ZERO)
  sales=sumcode('4000','credit')-sumcode('4010','debit');expenses=sum((D(x.debit or 0)-D(x.credit or 0) for x in j if am.get(x.account_id) in ('5000','6000','6100','1201')),ZERO)
  return page(req,s,'Dashboard',sales=sales,profit=sales-expenses,receivables=sumcode('1100','debit')-sumcode('1100','credit'),payables=sumcode('2000','credit')-sumcode('2000','debit'),docs=docs[-8:],doc_kinds=KINDS,months=[{'label':f'{m:02d}','sales':float(sum((D(x.credit or 0) for x in j if am.get(x.account_id)=='4000' and x.date[5:7]==f'{m:02d}'),ZERO))} for m in range(1,13)])
@@ -246,13 +267,20 @@ async def master_add(req:Request,kind:str,code:str=Form(...),name:str=Form(...),
 async def master_edit(req:Request,kind:str,mid:int,code:str=Form(...),name:str=Form(...),extra:str=Form('{}'),s=Depends(db)):
  u=user(req,s);x=master(s,u.company_id,kind,mid)
  data=await master_extra(req,kind)
- # COA codes used by the automatic posting engine are immutable.
- if kind=='coa' and x.code in [a[0] for a in ACCOUNTS] and code!=x.code:raise HTTPException(400,'Kode akun sistem tidak boleh diubah')
+ if s.query(Master).filter(Master.company_id==u.company_id,Master.kind==kind,Master.code==code.strip(),Master.id!=mid).first():
+  raise HTTPException(400,'Kode sudah digunakan master lain')
+ if kind=='coa':
+  old=json.loads(x.extra or '{}')
+  system=old.get('system_code') or (x.code if x.code in SYSTEM_CODES else None)
+  if system:
+   data['system_code']=system
+   # Account classification drives financial reports: do not silently change system account class.
+   data['type']=SYSTEM_CODES[system][1]
  x.code=code.strip()[:60];x.name=name.strip()[:180];x.extra=json.dumps(data);s.commit();return go('/masters/'+kind)
 @app.post('/masters/{kind}/{mid}/delete')
 def master_delete(req:Request,kind:str,mid:int,s=Depends(db)):
  u=user(req,s);x=master(s,u.company_id,kind,mid)
- if kind=='coa' and (x.code in [a[0] for a in ACCOUNTS] or s.query(Journal).filter_by(company_id=u.company_id,account_id=mid).first()):raise HTTPException(400,'Akun sistem atau akun terpakai tidak bisa dihapus')
+ if kind=='coa' and (system_code(x) in SYSTEM_CODES or s.query(Journal).filter_by(company_id=u.company_id,account_id=mid).first()):raise HTTPException(400,'Akun sistem atau akun terpakai tidak bisa dihapus')
  if kind=='warehouse' and s.query(Stock).filter_by(company_id=u.company_id,warehouse_id=mid).first():raise HTTPException(400,'Gudang sudah memiliki mutasi')
  if kind=='item' and s.query(Stock).filter_by(company_id=u.company_id,item_id=mid).first():raise HTTPException(400,'Barang sudah memiliki mutasi')
  if s.query(Document).filter_by(company_id=u.company_id,party_id=mid).first():raise HTTPException(400,'Master digunakan dokumen')
@@ -320,6 +348,56 @@ def document_post(req:Request,kind:str,did:int,s=Depends(db)):
  try:post(s,x);s.commit()
  except:s.rollback();raise
  return go('/documents/'+kind)
+@app.get('/documents/sale/{did}/print/{print_type}')
+def print_sale(req:Request,did:int,print_type:str,s=Depends(db)):
+ u=user(req,s)
+ if print_type not in ('invoice','delivery'):raise HTTPException(404,'Jenis cetakan tidak ditemukan')
+ doc=owned(s,Document,did,u.company_id)
+ if doc.kind!='sale' or doc.status!='posted':raise HTTPException(400,'Cetak hanya tersedia untuk faktur penjualan yang sudah diposting')
+ company=s.get(Company,u.company_id)
+ party=master(s,u.company_id,'customer',doc.party_id) if doc.party_id else None
+ payload=json.loads(doc.payload or '{}')
+ output=io.BytesIO();pdf=Canvas(output,pagesize=A4)
+ W,H=A4; margin=42;y=H-48
+ def txt(x,y,value,size=10,bold=False):
+  pdf.setFont('Helvetica-Bold' if bold else 'Helvetica',size)
+  pdf.drawString(x,y,str(value).encode('latin-1','replace').decode('latin-1'))
+ def header():
+  nonlocal y
+  y=H-48
+  txt(margin,y,company.name,16,True);y-=28
+  txt(margin,y,'FAKTUR PENJUALAN' if print_type=='invoice' else 'SURAT JALAN',14,True);y-=24
+  txt(margin,y,'Nomor: '+doc.number+'    Tanggal: '+doc.date);y-=18
+  txt(margin,y,'Pelanggan: '+(party.name if party else '-'));y-=24
+  pdf.line(margin,y,W-margin,y);y-=22
+  txt(margin,y,'No.',9,True);txt(margin+32,y,'Barang / Jasa',9,True);txt(margin+290,y,'Qty',9,True)
+  if print_type=='invoice':txt(margin+350,y,'Harga',9,True);txt(margin+440,y,'Jumlah',9,True)
+  y-=18
+ header()
+ subtotal=Decimal('0');tax=Decimal('0')
+ for idx,line in enumerate(payload.get('items',[]),1):
+  if y<110:pdf.showPage();header()
+  item=master(s,u.company_id,'item',int(line['item_id']))
+  q=Decimal(str(line['qty']));price=dec(line['price']);base=dec(q*price);vat=dec(base*dec(line.get('tax_rate',0))/100)
+  subtotal+=base;tax+=vat
+  name=item.name[:42]
+  txt(margin,y,str(idx),9);txt(margin+32,y,name,9);txt(margin+290,y,str(q.normalize()),9)
+  if print_type=='invoice':txt(margin+350,y,f'{price:,.0f}',9);txt(margin+440,y,f'{base:,.0f}',9)
+  y-=22
+ if print_type=='invoice':
+  if y<115:pdf.showPage();header()
+  pdf.line(margin,y,W-margin,y);y-=22
+  txt(margin+290,y,'Subtotal',10,True);txt(margin+440,y,f'{subtotal:,.0f}',10);y-=19
+  txt(margin+290,y,'PPN',10,True);txt(margin+440,y,f'{tax:,.0f}',10);y-=19
+  txt(margin+290,y,'Total',11,True);txt(margin+440,y,f'{subtotal+tax:,.0f}',11,True)
+ else:
+  if y<125:pdf.showPage();header()
+  y-=45;txt(margin,y,'Diterima oleh,');txt(margin+310,y,'Diserahkan oleh,');y-=65
+  txt(margin,y,'(____________________)');txt(margin+310,y,'(____________________)')
+ pdf.save();output.seek(0)
+ filename=('faktur-' if print_type=='invoice' else 'surat-jalan-')+str(doc.id)+'.pdf'
+ return StreamingResponse(output,media_type='application/pdf',headers={'Content-Disposition':f'inline; filename="{filename}"'})
+
 @app.get('/reports/{name}')
 def report(req:Request,name:str,format:str='html',s=Depends(db)):
  u=user(req,s);cid=u.company_id
@@ -328,21 +406,21 @@ def report(req:Request,name:str,format:str='html',s=Depends(db)):
  if name in ('journals','ledger','trial','profit','balance','cashflow','bank'):
   if name=='journals':heads=['Tanggal','Dokumen','Akun','Debit','Kredit'];data=[[x.date,docs[x.doc_id].number,am[x.account_id].code+' '+am[x.account_id].name,float(x.debit),float(x.credit)] for x in js]
   elif name=='ledger':heads=['Tanggal','Dokumen','Akun','Debit','Kredit'];data=[[x.date,docs[x.doc_id].number,am[x.account_id].code+' '+am[x.account_id].name,float(x.debit),float(x.credit)] for x in sorted(js,key=lambda z:(am[z.account_id].code,z.date,z.id))]
-  elif name=='bank':heads=['Tanggal','Dokumen','Akun','Masuk','Keluar'];data=[[x.date,docs[x.doc_id].number,am[x.account_id].name,float(x.debit),float(x.credit)] for x in js if am[x.account_id].code in ('1000','1010')]
+  elif name=='bank':heads=['Tanggal','Dokumen','Akun','Masuk','Keluar'];data=[[x.date,docs[x.doc_id].number,am[x.account_id].name,float(x.debit),float(x.credit)] for x in js if system_code(am[x.account_id]) in ('1000','1010')]
   else:
    totals={x.id:[ZERO,ZERO] for x in coa_rows}
    for j in js:totals[j.account_id][0]+=D(j.debit);totals[j.account_id][1]+=D(j.credit)
    if name=='trial':heads=['Kode','Akun','Debit','Kredit'];data=[[x.code,x.name,float(max(0,totals[x.id][0]-totals[x.id][1])),float(max(0,totals[x.id][1]-totals[x.id][0]))] for x in coa_rows]
    elif name=='profit':heads=['Kode','Akun','Saldo (Kredit - Debit)'];data=[[x.code,x.name,float(totals[x.id][1]-totals[x.id][0])] for x in coa_rows if json.loads(x.extra or '{}').get('type') in ('income','contra_income','expense')]
    elif name=='balance':heads=['Kode','Akun','Saldo (Debit - Kredit)'];data=[[x.code,x.name,float(totals[x.id][0]-totals[x.id][1])] for x in coa_rows if json.loads(x.extra or '{}').get('type') in ('asset','contra_asset','liability','equity')]
-   else:heads=['Aktivitas','Jumlah'];data=[['Kas dan Bank - Saldo Bersih',float(sum((D(x.debit)-D(x.credit) for x in js if am[x.account_id].code in ('1000','1010')),ZERO))]]
+   else:heads=['Aktivitas','Jumlah'];data=[['Kas dan Bank - Saldo Bersih',float(sum((D(x.debit)-D(x.credit) for x in js if system_code(am[x.account_id]) in ('1000','1010')),ZERO))]]
  elif name in ('stock','valuation'):
   heads=['Barang','Gudang','Qty','Nilai'];pairs=sorted({(x.item_id,x.warehouse_id) for x in ss});data=[]
   for iid,wid in pairs:
    q=sum((D(x.qty) for x in ss if x.item_id==iid and x.warehouse_id==wid),D(0));v=sum((D(x.value) for x in ss if x.item_id==iid and x.warehouse_id==wid),D(0))
    data.append([s.get(Master,iid).name,s.get(Master,wid).name,float(q),float(v)])
  elif name in ('receivables','payables'):
-  code='1100' if name=='receivables' else '2000';heads=['Dokumen','Tanggal','Debit','Kredit'];data=[[docs[x.doc_id].number,x.date,float(x.debit),float(x.credit)] for x in js if am[x.account_id].code==code]
+  code='1100' if name=='receivables' else '2000';heads=['Dokumen','Tanggal','Debit','Kredit'];data=[[docs[x.doc_id].number,x.date,float(x.debit),float(x.credit)] for x in js if system_code(am[x.account_id])==code]
  elif name=='assets':
   heads=['Kode','Aset','Harga Perolehan','Residu','Umur (bulan)','Penyusutan/Bulan'];data=[]
   for a in s.query(Master).filter_by(company_id=cid,kind='asset'):

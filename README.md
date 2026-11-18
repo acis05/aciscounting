@@ -32,3 +32,13 @@ MVP FastAPI + PostgreSQL untuk GitHub dan Railway. Brand/logo Acis dipertahankan
 
 ## Pengujian lokal yang dilakukan
 Registrasi, halaman master, form transaksi, posting pembelian + PPN, posting penjualan + PPN + HPP, dan retur penjualan berhasil diuji menggunakan SQLite dan TestClient. PostgreSQL Railway dan tampilan di perangkat fisik belum diuji.
+
+## Pembaruan v0.4
+
+- Kode COA sistem boleh diganti. Identitas akun untuk jurnal otomatis disimpan pada `extra.system_code` (tidak perlu migrasi skema database). Tipe akun sistem dipertahankan agar klasifikasi laporan tidak rusak.
+- Jika database perusahaan lama belum memiliki akun sistem seperti PPN Masukan 1150, aplikasi membuat akun sistem yang hilang saat posting. Jika terjadi konflik kode dengan akun lain, perbaiki COA dahulu.
+- Cetak faktur dan surat jalan PDF tersedia di daftar Faktur Penjualan setelah Posting. Surat jalan hanya berisi nama barang dan jumlah, tanpa harga, subtotal, atau PPN.
+- Sidebar menggunakan ikon dan submenu visual yang lebih jelas, termasuk pada layar HP.
+- Error validasi dari formulir ditampilkan sebagai halaman penjelasan, bukan JSON mentah (respons API yang meminta JSON tetap JSON).
+
+**Perhatian:** Lakukan backup PostgreSQL sebelum deploy. Uji data historis dan perhitungan pajak dengan akuntan sebelum penggunaan produksi. Dokumen cetak belum termasuk nomor seri pajak, tanda tangan digital, alamat lengkap, atau format faktur pajak resmi.
