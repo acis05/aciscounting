@@ -37,9 +37,9 @@ class Journal(Base):
 class Stock(Base):
  __tablename__='stocks';id=Column(Integer,primary_key=True);company_id=Column(Integer,index=True);doc_id=Column(Integer,ForeignKey('documents.id'),index=True);date=Column(String(10));item_id=Column(Integer);warehouse_id=Column(Integer);qty=Column(Numeric(18,4),default=0);value=Column(Numeric(18,2),default=0);unit_cost=Column(Numeric(18,4),default=0)
 Base.metadata.create_all(engine)
-app=FastAPI(title='aciscounting.id',version='0.1.0')
+app=FastAPI(title='aciscounting.id',version='0.3.0')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SECRET_KEY','DEV_ONLY_CHANGE_THIS_SECRET'),https_only=os.getenv('COOKIE_SECURE','false').lower()=='true',same_site='lax')
-ROOT=os.path.dirname(__file__);app.mount('/static',StaticFiles(directory=ROOT+'/static'),name='static');tpl=Jinja2Templates(directory=ROOT+'/templates')
+ROOT=os.path.dirname(__file__);tplfilter=lambda v: json.loads(v or '{}');app.mount('/static',StaticFiles(directory=ROOT+'/static'),name='static');tpl=Jinja2Templates(directory=ROOT+'/templates');tpl.env.filters['from_json']=tplfilter
 @app.get('/health')
 def health():return {'status':'ok'}
 def db():
@@ -58,7 +58,7 @@ def page(req,s,title,**ctx):
  except HTTPException:u=None
  c=s.get(Company,u.company_id) if u else None
  return tpl.TemplateResponse('app.html',{'request':req,'title':title,'user':u,'company':c,'cash':cash,'today':date.today().isoformat(),**ctx})
-ACCOUNTS=[('1000','Kas','asset'),('1010','Bank','asset'),('1100','Piutang Usaha','asset'),('1200','Persediaan','asset'),('1500','Aset Tetap','asset'),('1590','Akumulasi Penyusutan','contra_asset'),('2000','Hutang Usaha','liability'),('3000','Modal','equity'),('4000','Penjualan','income'),('4010','Retur Penjualan','contra_income'),('5000','HPP','expense'),('6000','Beban Operasional','expense'),('6100','Beban Penyusutan','expense'),('1201','Selisih Persediaan','expense')]
+ACCOUNTS=[('1000','Kas','asset'),('1010','Bank','asset'),('1100','Piutang Usaha','asset'),('1200','Persediaan','asset'),('1500','Aset Tetap','asset'),('1590','Akumulasi Penyusutan','contra_asset'),('2000','Hutang Usaha','liability'),('3000','Modal','equity'),('4000','Penjualan','income'),('4010','Retur Penjualan','contra_income'),('5000','HPP','expense'),('6000','Beban Operasional','expense'),('6100','Beban Penyusutan','expense'),('1201','Selisih Persediaan','expense'),('1150','PPN Masukan','asset'),('2100','PPN Keluaran','liability')]
 def seed(s,cid):
  for code,name,typ in ACCOUNTS:s.add(Master(company_id=cid,kind='coa',code=code,name=name,extra=json.dumps({'type':typ})))
  s.add(Master(company_id=cid,kind='warehouse',code='GD-01',name='Gudang Utama'))
@@ -105,12 +105,63 @@ def post(s,doc):
  elif k=='cash_out':E=[(p.get('account','6000'),amount,0),('1000',0,amount)]
  elif k=='bank_in':E=[('1010',amount,0),(p.get('account','4000'),0,amount)]
  elif k=='bank_out':E=[(p.get('account','6000'),amount,0),('1010',0,amount)]
- elif k=='sale':
-  if qty<=0 or amount<=0:raise HTTPException(400,'Qty dan nominal harus positif')
-  cost=stockout(s,doc,item,wh,qty);E=[('1100',amount,0),('4000',0,amount),('5000',cost,0),('1200',0,cost)]
- elif k=='purchase':
-  if qty<=0 or amount<=0:raise HTTPException(400,'Qty dan nominal harus positif')
-  move(s,doc,item,wh,qty,amount);E=[('1200',amount,0),('2000',0,amount)]
+ elif k in ('sale','purchase','sale_return','purchase_return'):
+  items=p.get('items',[])
+  if not isinstance(items,list) or not items:raise HTTPException(400,'Tambahkan minimal satu baris barang atau jasa')
+  subtotal=ZERO;tax=ZERO;cost_total=ZERO
+  if len({str(z.get('item_id')) for z in items})!=len(items):raise HTTPException(400,'Barang yang sama cukup satu baris')
+  original=None
+  if k in ('sale_return','purchase_return'):
+   source_id=int(p.get('source_id') or 0)
+   original=owned(s,Document,source_id,doc.company_id)
+   if original.kind!=('sale' if k=='sale_return' else 'purchase') or original.status!='posted':raise HTTPException(400,'Pilih faktur asal yang sudah diposting')
+   if doc.party_id!=original.party_id:raise HTTPException(400,'Pelanggan/pemasok harus sama dengan faktur asal')
+   if doc.date<original.date:raise HTTPException(400,'Tanggal retur tidak boleh sebelum faktur')
+   source_lines={str(z.get('item_id')):z for z in json.loads(original.payload).get('items',[])}
+  for line in items:
+   iid=int(line.get('item_id') or 0);x=master(s,doc.company_id,'item',iid)
+   quantity=D(str(line.get('qty') or 0));price=dec(line.get('price'));rate=dec(line.get('tax_rate',0))
+   if quantity<=0 or price<0 or rate not in (ZERO,D('11.00'),D('12.00')):raise HTTPException(400,'Qty, harga, atau tarif PPN tidak valid')
+   # Use 0%, 11%, 12% as configurable nominal rate; tax regulations can require different effective bases.
+   base=dec(quantity*price);vat=dec(base*rate/D(100));subtotal+=base;tax+=vat
+   item_type=json.loads(x.extra or '{}').get('type','goods')
+   if item_type not in ('goods','service'):raise HTTPException(400,'Tipe barang/jasa tidak valid')
+   if original:
+    sl=source_lines.get(str(iid))
+    if not sl:raise HTTPException(400,'Barang retur tidak ditemukan pada faktur asal')
+    returned=ZERO
+    other=s.query(Document).filter_by(company_id=doc.company_id,kind=k,status='posted').all()
+    for r in other:
+     rp=json.loads(r.payload)
+     if int(rp.get('source_id') or 0)==original.id:
+      returned+=sum((D(str(z.get('qty') or 0)) for z in rp.get('items',[]) if int(z.get('item_id') or 0)==iid),D(0))
+    if quantity+returned>D(str(sl.get('qty') or 0)):raise HTTPException(400,'Jumlah retur melebihi faktur asal')
+    if price!=dec(sl.get('price')) or rate!=dec(sl.get('tax_rate',0)):raise HTTPException(400,'Harga dan PPN retur harus sama dengan faktur asal')
+   if item_type=='service' and k in ('purchase','purchase_return'):raise HTTPException(400,'Pembelian jasa belum didukung dalam modul persediaan; gunakan jurnal biaya')
+   if item_type=='goods':
+    if not wh:raise HTTPException(400,'Pilih gudang untuk barang persediaan')
+    if k=='purchase':move(s,doc,iid,wh,quantity,base)
+    elif k=='sale':
+     value=stockout(s,doc,iid,wh,quantity);cost_total+=value
+     line['posted_cost']=str(value)
+    elif k=='sale_return':
+     original_cost=dec(sl.get('posted_cost',0));original_qty=D(str(sl.get('qty')))
+     value=dec(original_cost*quantity/original_qty)
+     move(s,doc,iid,wh,quantity,value);cost_total+=value
+    elif k=='purchase_return':cost_total+=stockout(s,doc,iid,wh,quantity)
+  amount=subtotal+tax
+  p['amount']=str(amount);p['subtotal']=str(subtotal);p['tax']=str(tax);doc.payload=json.dumps(p)
+  if k=='purchase':
+   E=[('1200',subtotal,0),('1150',tax,0),('2000',0,amount)]
+  elif k=='sale':
+   E=[('1100',amount,0),('4000',0,subtotal),('2100',0,tax),('5000',cost_total,0),('1200',0,cost_total)]
+  elif k=='sale_return':
+   E=[('4010',subtotal,0),('2100',tax,0),('1100',0,amount),('1200',cost_total,0),('5000',0,cost_total)]
+  else:
+   E=[('2000',amount,0),('1200',0,cost_total),('1150',0,tax)]
+   difference=subtotal-cost_total
+   if difference>0:E.append(('1201',0,difference))
+   elif difference<0:E.append(('1201',-difference,0))
  elif k=='sale_receipt':E=[(p.get('bank','1010'),amount,0),('1100',0,amount)]
  elif k=='purchase_payment':E=[('2000',amount,0),(p.get('bank','1010'),0,amount)]
  elif k=='sale_return':
@@ -173,19 +224,28 @@ def masters(req:Request,kind:str,s=Depends(db)):
  if kind not in MASTER_KINDS:raise HTTPException(404)
  items=s.query(Master).filter_by(company_id=u.company_id,kind=kind).order_by(Master.code).all()
  return page(req,s,MASTER_KINDS[kind],items=items,kind=kind,kind_label=MASTER_KINDS[kind])
+async def master_extra(req,kind):
+ f=await req.form()
+ if kind=='coa':return {'type':f.get('account_type') or 'asset'}
+ if kind=='item':return {'type':f.get('item_type') or 'goods'}
+ if kind=='asset':
+  cost=dec(f.get('asset_cost'));residual=dec(f.get('asset_residual'))
+  months=int(f.get('asset_months') or 0)
+  if months<1 or cost<residual:raise HTTPException(400,'Data aset tidak valid')
+  return {'cost':str(cost),'residual':str(residual),'months':months,'start':f.get('asset_start') or date.today().strftime('%Y-%m')}
+ return {}
+
 @app.post('/masters/{kind}')
-def master_add(req:Request,kind:str,code:str=Form(...),name:str=Form(...),extra:str=Form('{}'),s=Depends(db)):
+async def master_add(req:Request,kind:str,code:str=Form(...),name:str=Form(...),extra:str=Form('{}'),s=Depends(db)):
  u=user(req,s)
  if kind not in MASTER_KINDS:raise HTTPException(404)
- try:data=json.loads(extra or '{}');assert isinstance(data,dict)
- except:raise HTTPException(400,'Extra harus JSON object')
+ data=await master_extra(req,kind)
  if s.query(Master).filter_by(company_id=u.company_id,kind=kind,code=code.strip()).first():raise HTTPException(400,'Kode sudah dipakai')
  s.add(Master(company_id=u.company_id,kind=kind,code=code.strip()[:60],name=name.strip()[:180],extra=json.dumps(data)));s.commit();return go('/masters/'+kind)
 @app.post('/masters/{kind}/{mid}/edit')
-def master_edit(req:Request,kind:str,mid:int,code:str=Form(...),name:str=Form(...),extra:str=Form('{}'),s=Depends(db)):
+async def master_edit(req:Request,kind:str,mid:int,code:str=Form(...),name:str=Form(...),extra:str=Form('{}'),s=Depends(db)):
  u=user(req,s);x=master(s,u.company_id,kind,mid)
- try:data=json.loads(extra);assert isinstance(data,dict)
- except:raise HTTPException(400,'Extra harus JSON object')
+ data=await master_extra(req,kind)
  # COA codes used by the automatic posting engine are immutable.
  if kind=='coa' and x.code in [a[0] for a in ACCOUNTS] and code!=x.code:raise HTTPException(400,'Kode akun sistem tidak boleh diubah')
  x.code=code.strip()[:60];x.name=name.strip()[:180];x.extra=json.dumps(data);s.commit();return go('/masters/'+kind)
@@ -203,23 +263,49 @@ def documents(req:Request,kind:str,s=Depends(db)):
  if kind not in KINDS:raise HTTPException(404)
  items=s.query(Document).filter_by(company_id=u.company_id,kind=kind).order_by(Document.id.desc()).all()
  lists={k:s.query(Master).filter_by(company_id=u.company_id,kind=k).all() for k in ('customer','supplier','item','warehouse','coa','asset')}
- return page(req,s,KINDS[kind],kind=kind,items=items,lists=lists,kind_label=KINDS[kind])
+ return page(req,s,KINDS[kind],kind=kind,items=items,lists=lists,kind_label=KINDS[kind],invoice_sources=s.query(Document).filter_by(company_id=u.company_id,kind=('sale' if kind=='sale_return' else 'purchase'),status='posted').all() if kind in ('sale_return','purchase_return') else [],doc_details={d.id:json.loads(d.payload) for d in items})
+LINE_KINDS=('sale','purchase','sale_return','purchase_return')
+async def form_payload(req,s,cid,kind):
+ form=await req.form()
+ if kind in LINE_KINDS:
+  ids=form.getlist('item_id[]');qtys=form.getlist('qty[]');prices=form.getlist('price[]');rates=form.getlist('tax_rate[]')
+  if not (len(ids)==len(qtys)==len(prices)==len(rates)):raise HTTPException(400,'Tabel barang tidak lengkap')
+  rows=[]
+  for iid,qty,price,rate in zip(ids,qtys,prices,rates):
+   if not iid:continue
+   master(s,cid,'item',int(iid))
+   rows.append({'item_id':int(iid),'qty':str(qty),'price':str(price),'tax_rate':str(rate)})
+  if not rows:raise HTTPException(400,'Tambahkan minimal satu barang/jasa')
+  p={'items':rows}
+  if kind.endswith('return'):p['source_id']=int(form.get('source_id') or 0)
+  return p
+ if kind=='journal':
+  entries=[]
+  for code,dr,cr in zip(form.getlist('account[]'),form.getlist('debit[]'),form.getlist('credit[]')):
+   if code and (dec(dr) or dec(cr)):entries.append({'account':code,'debit':str(dr or 0),'credit':str(cr or 0)})
+  return {'entries':entries}
+ if kind in ('transfer','adjust'):
+  return {'item_id':int(form.get('single_item_id') or 0),'qty':str(form.get('single_qty') or 0),'amount':str(form.get('single_amount') or 0),'to_warehouse':int(form.get('to_warehouse') or 0)}
+ return {'amount':str(form.get('amount') or 0),'account':form.get('account') or '6000','bank':form.get('bank') or '1010'}
+
 @app.post('/documents/{kind}')
-def document_add(req:Request,kind:str,number:str=Form(...),date_value:str=Form(...,alias='date'),party_id:int=Form(0),warehouse_id:int=Form(0),memo:str=Form(''),payload:str=Form('{}'),s=Depends(db)):
+async def document_add(req:Request,kind:str,number:str=Form(...),date_value:str=Form(...,alias='date'),party_id:int=Form(0),warehouse_id:int=Form(0),memo:str=Form(''),payload:str=Form('{}'),s=Depends(db)):
  u=user(req,s)
  if kind not in KINDS:raise HTTPException(404)
- try:date.fromisoformat(date_value);p=json.loads(payload);assert isinstance(p,dict)
- except:raise HTTPException(400,'Tanggal atau JSON payload tidak valid')
- if party_id:owned(s,Master,party_id,u.company_id)
+ try:date.fromisoformat(date_value)
+ except:raise HTTPException(400,'Tanggal tidak valid')
+ p=await form_payload(req,s,u.company_id,kind)
+ if party_id:master(s,u.company_id,'customer' if kind in ('sale','sale_receipt','sale_return') else 'supplier' if kind in ('purchase','purchase_payment','purchase_return') else 'customer',party_id)
  if warehouse_id:master(s,u.company_id,'warehouse',warehouse_id)
  doc=Document(company_id=u.company_id,kind=kind,number=number.strip()[:60],date=date_value,party_id=party_id or None,warehouse_id=warehouse_id or None,memo=memo[:1000],payload=json.dumps(p));s.add(doc);s.commit();return go('/documents/'+kind)
 @app.post('/documents/{kind}/{did}/edit')
-def document_edit(req:Request,kind:str,did:int,number:str=Form(...),date_value:str=Form(...,alias='date'),party_id:int=Form(0),warehouse_id:int=Form(0),memo:str=Form(''),payload:str=Form('{}'),s=Depends(db)):
+async def document_edit(req:Request,kind:str,did:int,number:str=Form(...),date_value:str=Form(...,alias='date'),party_id:int=Form(0),warehouse_id:int=Form(0),memo:str=Form(''),payload:str=Form('{}'),s=Depends(db)):
  u=user(req,s);x=owned(s,Document,did,u.company_id)
  if x.kind!=kind or x.status!='draft':raise HTTPException(400,'Hanya draft yang bisa diedit')
- try:date.fromisoformat(date_value);p=json.loads(payload);assert isinstance(p,dict)
- except:raise HTTPException(400,'Tanggal atau JSON tidak valid')
- if party_id:owned(s,Master,party_id,u.company_id)
+ try:date.fromisoformat(date_value)
+ except:raise HTTPException(400,'Tanggal tidak valid')
+ p=await form_payload(req,s,u.company_id,kind)
+ if party_id:master(s,u.company_id,'customer' if kind in ('sale','sale_receipt','sale_return') else 'supplier' if kind in ('purchase','purchase_payment','purchase_return') else 'customer',party_id)
  if warehouse_id:master(s,u.company_id,'warehouse',warehouse_id)
  x.number=number.strip()[:60];x.date=date_value;x.party_id=party_id or None;x.warehouse_id=warehouse_id or None;x.memo=memo[:1000];x.payload=json.dumps(p);s.commit();return go('/documents/'+kind)
 @app.post('/documents/{kind}/{did}/delete')
