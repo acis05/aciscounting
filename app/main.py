@@ -1,0 +1,297 @@
+import os, json, io, csv, secrets
+from datetime import datetime, date
+from decimal import Decimal, ROUND_HALF_UP
+from contextlib import contextmanager
+from fastapi import FastAPI, Request, Depends, Form, HTTPException
+from fastapi.responses import RedirectResponse, StreamingResponse, Response
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, Numeric, Text, Boolean, UniqueConstraint, func
+from sqlalchemy.orm import declarative_base, sessionmaker
+from argon2 import PasswordHasher
+from openpyxl import Workbook
+from reportlab.pdfgen.canvas import Canvas
+from reportlab.lib.pagesizes import A4
+
+D=Decimal
+ZERO=D('0.00')
+def dec(v):
+    try: return D(str(v or 0)).quantize(D('.01'),rounding=ROUND_HALF_UP)
+    except: raise HTTPException(400,'Angka tidak valid')
+def cash(v): return 'Rp '+f'{dec(v):,.2f}'.replace(',','_').replace('.',',').replace('_','.')
+DB=os.getenv('DATABASE_URL','sqlite:///./accounting.db').replace('postgres://','postgresql://',1)
+engine=create_engine(DB,pool_pre_ping=True,connect_args={'check_same_thread':False} if DB.startswith('sqlite') else {})
+Session=sessionmaker(bind=engine,expire_on_commit=False)
+Base=declarative_base(); ph=PasswordHasher()
+class User(Base):
+ __tablename__='users';id=Column(Integer,primary_key=True);email=Column(String(200),unique=True,nullable=False);name=Column(String(120));password=Column(String(300));company_id=Column(Integer,ForeignKey('companies.id'))
+class Company(Base):
+ __tablename__='companies';id=Column(Integer,primary_key=True);name=Column(String(150),nullable=False);theme=Column(String(30),default='ocean');locked_through=Column(String(10),default='')
+class Master(Base):
+ __tablename__='masters';id=Column(Integer,primary_key=True);company_id=Column(Integer,index=True,nullable=False);kind=Column(String(25),nullable=False);code=Column(String(60),nullable=False);name=Column(String(180),nullable=False);extra=Column(Text,default='{}');active=Column(Boolean,default=True);__table_args__=(UniqueConstraint('company_id','kind','code'),)
+class Document(Base):
+ __tablename__='documents';id=Column(Integer,primary_key=True);company_id=Column(Integer,index=True,nullable=False);kind=Column(String(40),nullable=False);number=Column(String(60),nullable=False);date=Column(String(10),nullable=False);party_id=Column(Integer);warehouse_id=Column(Integer);status=Column(String(15),default='draft');memo=Column(Text,default='');payload=Column(Text,default='{}');created_at=Column(DateTime,default=datetime.utcnow);__table_args__=(UniqueConstraint('company_id','number'),)
+class Journal(Base):
+ __tablename__='journals';id=Column(Integer,primary_key=True);company_id=Column(Integer,index=True);doc_id=Column(Integer,ForeignKey('documents.id'),index=True);date=Column(String(10));account_id=Column(Integer);debit=Column(Numeric(18,2),default=0);credit=Column(Numeric(18,2),default=0);memo=Column(Text,default='')
+class Stock(Base):
+ __tablename__='stocks';id=Column(Integer,primary_key=True);company_id=Column(Integer,index=True);doc_id=Column(Integer,ForeignKey('documents.id'),index=True);date=Column(String(10));item_id=Column(Integer);warehouse_id=Column(Integer);qty=Column(Numeric(18,4),default=0);value=Column(Numeric(18,2),default=0);unit_cost=Column(Numeric(18,4),default=0)
+Base.metadata.create_all(engine)
+app=FastAPI(title='aciscounting.id',version='0.1.0')
+app.add_middleware(SessionMiddleware,secret_key=os.getenv('SECRET_KEY','DEV_ONLY_CHANGE_THIS_SECRET'),https_only=os.getenv('COOKIE_SECURE','false').lower()=='true',same_site='lax')
+ROOT=os.path.dirname(__file__);app.mount('/static',StaticFiles(directory=ROOT+'/static'),name='static');tpl=Jinja2Templates(directory=ROOT+'/templates')
+@app.get('/health')
+def health():return {'status':'ok'}
+def db():
+ with Session() as s:yield s
+def user(req,s):
+ uid=req.session.get('uid');u=s.get(User,uid) if uid else None
+ if not u:raise HTTPException(401,'Silakan login terlebih dahulu')
+ return u
+def owned(s,cls,id,cid):
+ x=s.get(cls,id)
+ if not x or x.company_id!=cid:raise HTTPException(404,'Data tidak ditemukan')
+ return x
+def go(path):return RedirectResponse(path,status_code=303)
+def page(req,s,title,**ctx):
+ try:u=user(req,s)
+ except HTTPException:u=None
+ c=s.get(Company,u.company_id) if u else None
+ return tpl.TemplateResponse('app.html',{'request':req,'title':title,'user':u,'company':c,'cash':cash,'today':date.today().isoformat(),**ctx})
+ACCOUNTS=[('1000','Kas','asset'),('1010','Bank','asset'),('1100','Piutang Usaha','asset'),('1200','Persediaan','asset'),('1500','Aset Tetap','asset'),('1590','Akumulasi Penyusutan','contra_asset'),('2000','Hutang Usaha','liability'),('3000','Modal','equity'),('4000','Penjualan','income'),('4010','Retur Penjualan','contra_income'),('5000','HPP','expense'),('6000','Beban Operasional','expense'),('6100','Beban Penyusutan','expense'),('1201','Selisih Persediaan','expense')]
+def seed(s,cid):
+ for code,name,typ in ACCOUNTS:s.add(Master(company_id=cid,kind='coa',code=code,name=name,extra=json.dumps({'type':typ})))
+ s.add(Master(company_id=cid,kind='warehouse',code='GD-01',name='Gudang Utama'))
+def master(s,cid,kind,mid):
+ x=owned(s,Master,mid,cid)
+ if x.kind!=kind:raise HTTPException(400,'Jenis master tidak sesuai')
+ return x
+def coa(s,cid,code):
+ x=s.query(Master).filter_by(company_id=cid,kind='coa',code=code).first()
+ if not x:raise HTTPException(400,f'COA {code} tidak ditemukan')
+ return x.id
+def lines(s,doc,entries):
+ debit=sum((dec(x[1]) for x in entries),ZERO);credit=sum((dec(x[2]) for x in entries),ZERO)
+ if debit!=credit:raise HTTPException(400,f'Jurnal tidak seimbang: {debit} / {credit}')
+ for code,dr,cr in entries:
+  if dec(dr)<0 or dec(cr)<0:raise HTTPException(400,'Jurnal negatif tidak diperbolehkan')
+  if dec(dr) or dec(cr):s.add(Journal(company_id=doc.company_id,doc_id=doc.id,date=doc.date,account_id=coa(s,doc.company_id,code),debit=dec(dr),credit=dec(cr),memo=doc.memo))
+def balances(s,cid,item,warehouse=None):
+ q=s.query(Stock).filter_by(company_id=cid,item_id=item)
+ if warehouse:q=q.filter_by(warehouse_id=warehouse)
+ rows=q.order_by(Stock.date,Stock.id).all()
+ return sum((D(x.qty) for x in rows),D(0)),sum((D(x.value) for x in rows),D(0))
+def move(s,doc,item,warehouse,qty,value):
+ master(s,doc.company_id,'item',item);master(s,doc.company_id,'warehouse',warehouse)
+ s.add(Stock(company_id=doc.company_id,doc_id=doc.id,date=doc.date,item_id=item,warehouse_id=warehouse,qty=qty,value=dec(value),unit_cost=(dec(value)/D(qty) if qty else 0)))
+def stockout(s,doc,item,warehouse,qty):
+ if qty<=0:raise HTTPException(400,'Jumlah harus positif')
+ whq,_=balances(s,doc.company_id,item,warehouse)
+ if whq<qty:raise HTTPException(400,'Stok gudang tidak cukup')
+ totalq,totalv=balances(s,doc.company_id,item)
+ cost=(totalv/totalq) if totalq>0 else D(0)
+ value=dec(cost*qty);move(s,doc,item,warehouse,-qty,-value);return value
+
+def post(s,doc):
+ if doc.status!='draft':raise HTTPException(400,'Hanya draft yang dapat diposting')
+ c=owned(s,Company,doc.company_id,doc.company_id) if False else s.get(Company,doc.company_id)
+ if c.locked_through and doc.date<=c.locked_through:raise HTTPException(400,'Periode sudah dikunci')
+ # Block backdated stock transactions to keep moving-average costs stable.
+ if doc.kind in ('sale','purchase','sale_return','purchase_return','transfer','adjust'):
+  latest=s.query(func.max(Stock.date)).filter_by(company_id=doc.company_id).scalar()
+  if latest and doc.date<latest:raise HTTPException(400,'Transaksi stok tidak boleh mundur tanggal; gunakan tanggal terkini')
+ p=json.loads(doc.payload);amount=dec(p.get('amount',0));qty=D(str(p.get('qty',0)));item=int(p.get('item_id') or 0);wh=int(doc.warehouse_id or 0);k=doc.kind;E=[]
+ if k=='cash_in':E=[('1000',amount,0),(p.get('account','4000'),0,amount)]
+ elif k=='cash_out':E=[(p.get('account','6000'),amount,0),('1000',0,amount)]
+ elif k=='bank_in':E=[('1010',amount,0),(p.get('account','4000'),0,amount)]
+ elif k=='bank_out':E=[(p.get('account','6000'),amount,0),('1010',0,amount)]
+ elif k=='sale':
+  if qty<=0 or amount<=0:raise HTTPException(400,'Qty dan nominal harus positif')
+  cost=stockout(s,doc,item,wh,qty);E=[('1100',amount,0),('4000',0,amount),('5000',cost,0),('1200',0,cost)]
+ elif k=='purchase':
+  if qty<=0 or amount<=0:raise HTTPException(400,'Qty dan nominal harus positif')
+  move(s,doc,item,wh,qty,amount);E=[('1200',amount,0),('2000',0,amount)]
+ elif k=='sale_receipt':E=[(p.get('bank','1010'),amount,0),('1100',0,amount)]
+ elif k=='purchase_payment':E=[('2000',amount,0),(p.get('bank','1010'),0,amount)]
+ elif k=='sale_return':
+  if qty<=0 or amount<=0:raise HTTPException(400,'Qty dan nominal harus positif')
+  # Return cost supplied as original invoice cost, not current average.
+  cost=dec(p.get('cost',0));move(s,doc,item,wh,qty,cost);E=[('4010',amount,0),('1100',0,amount),('1200',cost,0),('5000',0,cost)]
+ elif k=='purchase_return':
+  cost=stockout(s,doc,item,wh,qty);E=[('2000',amount,0),('1200',0,cost)]
+  if amount>cost:E.append(('1201',0,amount-cost))
+  elif cost>amount:E.append(('1201',cost-amount,0))
+ elif k=='transfer':
+  dst=int(p.get('to_warehouse') or 0)
+  if dst==wh:raise HTTPException(400,'Gudang asal dan tujuan harus berbeda')
+  cost=stockout(s,doc,item,wh,qty);move(s,doc,item,dst,qty,cost);E=[]
+ elif k=='adjust':
+  if qty==0:raise HTTPException(400,'Qty penyesuaian tidak boleh nol')
+  if qty>0:
+   cost=amount;move(s,doc,item,wh,qty,cost);E=[('1200',cost,0),('1201',0,cost)]
+  else:
+   cost=stockout(s,doc,item,wh,-qty);E=[('1201',cost,0),('1200',0,cost)]
+ elif k=='journal':
+  E=[(x['account'],dec(x.get('debit',0)),dec(x.get('credit',0))) for x in p.get('entries',[])]
+ elif k=='depreciation':
+  E=[('6100',amount,0),('1590',0,amount)]
+ else:raise HTTPException(400,'Tipe dokumen tidak dikenali')
+ if k not in ('transfer','journal') and amount<=0 and k!='adjust':raise HTTPException(400,'Nominal harus positif')
+ if k=='journal' and not E:raise HTTPException(400,'Jurnal kosong')
+ lines(s,doc,E);doc.status='posted'
+
+KINDS={'cash_in':'Kas Masuk','cash_out':'Kas Keluar','bank_in':'Bank Masuk','bank_out':'Bank Keluar','sale':'Faktur Penjualan','sale_receipt':'Penerimaan Penjualan','sale_return':'Retur Penjualan','purchase':'Faktur Pembelian','purchase_payment':'Pembayaran Pembelian','purchase_return':'Retur Pembelian','transfer':'Transfer Gudang','adjust':'Penyesuaian Persediaan','journal':'Jurnal Umum','depreciation':'Penyusutan'}
+MASTER_KINDS={'coa':'COA','customer':'Pelanggan','supplier':'Pemasok','item':'Barang / Jasa','warehouse':'Gudang','asset':'Aset Tetap'}
+@app.get('/')
+def home(req:Request,s=Depends(db)):
+ try:u=user(req,s)
+ except HTTPException:return go('/login')
+ cid=u.company_id;docs=s.query(Document).filter_by(company_id=cid,status='posted').all();j=s.query(Journal).filter_by(company_id=cid).all();am={x.id:x.code for x in s.query(Master).filter_by(company_id=cid,kind='coa')}
+ def sumcode(code,side):return sum((D(getattr(x,side) or 0) for x in j if am.get(x.account_id)==code),ZERO)
+ sales=sumcode('4000','credit')-sumcode('4010','debit');expenses=sum((D(x.debit or 0)-D(x.credit or 0) for x in j if am.get(x.account_id) in ('5000','6000','6100','1201')),ZERO)
+ return page(req,s,'Dashboard',sales=sales,profit=sales-expenses,receivables=sumcode('1100','debit')-sumcode('1100','credit'),payables=sumcode('2000','credit')-sumcode('2000','debit'),docs=docs[-8:],doc_kinds=KINDS,months=[{'label':f'{m:02d}','sales':float(sum((D(x.credit or 0) for x in j if am.get(x.account_id)=='4000' and x.date[5:7]==f'{m:02d}'),ZERO))} for m in range(1,13)])
+@app.get('/register')
+def regpage(req:Request,s=Depends(db)):return page(req,s,'Daftar')
+@app.post('/register')
+def register(req:Request,name:str=Form(...),email:str=Form(...),password:str=Form(...),company:str=Form(...),s=Depends(db)):
+ email=email.lower().strip()
+ if len(password)<10:raise HTTPException(400,'Password minimal 10 karakter')
+ if s.query(User).filter_by(email=email).first():raise HTTPException(400,'Email sudah terdaftar')
+ c=Company(name=company[:150]);s.add(c);s.flush();u=User(name=name[:120],email=email,password=ph.hash(password),company_id=c.id);s.add(u);seed(s,c.id);s.commit();req.session.clear();req.session['uid']=u.id;return go('/')
+@app.get('/login')
+def loginpage(req:Request,s=Depends(db)):return page(req,s,'Login')
+@app.post('/login')
+def login(req:Request,email:str=Form(...),password:str=Form(...),s=Depends(db)):
+ u=s.query(User).filter_by(email=email.lower().strip()).first()
+ if not u or not ph.verify(u.password,password):raise HTTPException(401,'Email atau password salah')
+ req.session.clear();req.session['uid']=u.id;return go('/')
+@app.post('/logout')
+def logout(req:Request):req.session.clear();return go('/login')
+@app.get('/masters/{kind}')
+def masters(req:Request,kind:str,s=Depends(db)):
+ u=user(req,s)
+ if kind not in MASTER_KINDS:raise HTTPException(404)
+ items=s.query(Master).filter_by(company_id=u.company_id,kind=kind).order_by(Master.code).all()
+ return page(req,s,MASTER_KINDS[kind],items=items,kind=kind,kind_label=MASTER_KINDS[kind])
+@app.post('/masters/{kind}')
+def master_add(req:Request,kind:str,code:str=Form(...),name:str=Form(...),extra:str=Form('{}'),s=Depends(db)):
+ u=user(req,s)
+ if kind not in MASTER_KINDS:raise HTTPException(404)
+ try:data=json.loads(extra or '{}');assert isinstance(data,dict)
+ except:raise HTTPException(400,'Extra harus JSON object')
+ if s.query(Master).filter_by(company_id=u.company_id,kind=kind,code=code.strip()).first():raise HTTPException(400,'Kode sudah dipakai')
+ s.add(Master(company_id=u.company_id,kind=kind,code=code.strip()[:60],name=name.strip()[:180],extra=json.dumps(data)));s.commit();return go('/masters/'+kind)
+@app.post('/masters/{kind}/{mid}/edit')
+def master_edit(req:Request,kind:str,mid:int,code:str=Form(...),name:str=Form(...),extra:str=Form('{}'),s=Depends(db)):
+ u=user(req,s);x=master(s,u.company_id,kind,mid)
+ try:data=json.loads(extra);assert isinstance(data,dict)
+ except:raise HTTPException(400,'Extra harus JSON object')
+ # COA codes used by the automatic posting engine are immutable.
+ if kind=='coa' and x.code in [a[0] for a in ACCOUNTS] and code!=x.code:raise HTTPException(400,'Kode akun sistem tidak boleh diubah')
+ x.code=code.strip()[:60];x.name=name.strip()[:180];x.extra=json.dumps(data);s.commit();return go('/masters/'+kind)
+@app.post('/masters/{kind}/{mid}/delete')
+def master_delete(req:Request,kind:str,mid:int,s=Depends(db)):
+ u=user(req,s);x=master(s,u.company_id,kind,mid)
+ if kind=='coa' and (x.code in [a[0] for a in ACCOUNTS] or s.query(Journal).filter_by(company_id=u.company_id,account_id=mid).first()):raise HTTPException(400,'Akun sistem atau akun terpakai tidak bisa dihapus')
+ if kind=='warehouse' and s.query(Stock).filter_by(company_id=u.company_id,warehouse_id=mid).first():raise HTTPException(400,'Gudang sudah memiliki mutasi')
+ if kind=='item' and s.query(Stock).filter_by(company_id=u.company_id,item_id=mid).first():raise HTTPException(400,'Barang sudah memiliki mutasi')
+ if s.query(Document).filter_by(company_id=u.company_id,party_id=mid).first():raise HTTPException(400,'Master digunakan dokumen')
+ s.delete(x);s.commit();return go('/masters/'+kind)
+@app.get('/documents/{kind}')
+def documents(req:Request,kind:str,s=Depends(db)):
+ u=user(req,s)
+ if kind not in KINDS:raise HTTPException(404)
+ items=s.query(Document).filter_by(company_id=u.company_id,kind=kind).order_by(Document.id.desc()).all()
+ lists={k:s.query(Master).filter_by(company_id=u.company_id,kind=k).all() for k in ('customer','supplier','item','warehouse','coa','asset')}
+ return page(req,s,KINDS[kind],kind=kind,items=items,lists=lists,kind_label=KINDS[kind])
+@app.post('/documents/{kind}')
+def document_add(req:Request,kind:str,number:str=Form(...),date_value:str=Form(...,alias='date'),party_id:int=Form(0),warehouse_id:int=Form(0),memo:str=Form(''),payload:str=Form('{}'),s=Depends(db)):
+ u=user(req,s)
+ if kind not in KINDS:raise HTTPException(404)
+ try:date.fromisoformat(date_value);p=json.loads(payload);assert isinstance(p,dict)
+ except:raise HTTPException(400,'Tanggal atau JSON payload tidak valid')
+ if party_id:owned(s,Master,party_id,u.company_id)
+ if warehouse_id:master(s,u.company_id,'warehouse',warehouse_id)
+ doc=Document(company_id=u.company_id,kind=kind,number=number.strip()[:60],date=date_value,party_id=party_id or None,warehouse_id=warehouse_id or None,memo=memo[:1000],payload=json.dumps(p));s.add(doc);s.commit();return go('/documents/'+kind)
+@app.post('/documents/{kind}/{did}/edit')
+def document_edit(req:Request,kind:str,did:int,number:str=Form(...),date_value:str=Form(...,alias='date'),party_id:int=Form(0),warehouse_id:int=Form(0),memo:str=Form(''),payload:str=Form('{}'),s=Depends(db)):
+ u=user(req,s);x=owned(s,Document,did,u.company_id)
+ if x.kind!=kind or x.status!='draft':raise HTTPException(400,'Hanya draft yang bisa diedit')
+ try:date.fromisoformat(date_value);p=json.loads(payload);assert isinstance(p,dict)
+ except:raise HTTPException(400,'Tanggal atau JSON tidak valid')
+ if party_id:owned(s,Master,party_id,u.company_id)
+ if warehouse_id:master(s,u.company_id,'warehouse',warehouse_id)
+ x.number=number.strip()[:60];x.date=date_value;x.party_id=party_id or None;x.warehouse_id=warehouse_id or None;x.memo=memo[:1000];x.payload=json.dumps(p);s.commit();return go('/documents/'+kind)
+@app.post('/documents/{kind}/{did}/delete')
+def document_delete(req:Request,kind:str,did:int,s=Depends(db)):
+ u=user(req,s);x=owned(s,Document,did,u.company_id)
+ if x.kind!=kind or x.status!='draft':raise HTTPException(400,'Hanya draft dapat dihapus')
+ s.delete(x);s.commit();return go('/documents/'+kind)
+@app.post('/documents/{kind}/{did}/post')
+def document_post(req:Request,kind:str,did:int,s=Depends(db)):
+ u=user(req,s);x=owned(s,Document,did,u.company_id)
+ if x.kind!=kind:raise HTTPException(404)
+ try:post(s,x);s.commit()
+ except:s.rollback();raise
+ return go('/documents/'+kind)
+@app.get('/reports/{name}')
+def report(req:Request,name:str,format:str='html',s=Depends(db)):
+ u=user(req,s);cid=u.company_id
+ coa_rows=s.query(Master).filter_by(company_id=cid,kind='coa').all();am={x.id:x for x in coa_rows};js=s.query(Journal).filter_by(company_id=cid).order_by(Journal.date,Journal.id).all();ss=s.query(Stock).filter_by(company_id=cid).order_by(Stock.date,Stock.id).all();docs={x.id:x for x in s.query(Document).filter_by(company_id=cid)}
+ data=[];heads=[]
+ if name in ('journals','ledger','trial','profit','balance','cashflow','bank'):
+  if name=='journals':heads=['Tanggal','Dokumen','Akun','Debit','Kredit'];data=[[x.date,docs[x.doc_id].number,am[x.account_id].code+' '+am[x.account_id].name,float(x.debit),float(x.credit)] for x in js]
+  elif name=='ledger':heads=['Tanggal','Dokumen','Akun','Debit','Kredit'];data=[[x.date,docs[x.doc_id].number,am[x.account_id].code+' '+am[x.account_id].name,float(x.debit),float(x.credit)] for x in sorted(js,key=lambda z:(am[z.account_id].code,z.date,z.id))]
+  elif name=='bank':heads=['Tanggal','Dokumen','Akun','Masuk','Keluar'];data=[[x.date,docs[x.doc_id].number,am[x.account_id].name,float(x.debit),float(x.credit)] for x in js if am[x.account_id].code in ('1000','1010')]
+  else:
+   totals={x.id:[ZERO,ZERO] for x in coa_rows}
+   for j in js:totals[j.account_id][0]+=D(j.debit);totals[j.account_id][1]+=D(j.credit)
+   if name=='trial':heads=['Kode','Akun','Debit','Kredit'];data=[[x.code,x.name,float(max(0,totals[x.id][0]-totals[x.id][1])),float(max(0,totals[x.id][1]-totals[x.id][0]))] for x in coa_rows]
+   elif name=='profit':heads=['Kode','Akun','Saldo (Kredit - Debit)'];data=[[x.code,x.name,float(totals[x.id][1]-totals[x.id][0])] for x in coa_rows if json.loads(x.extra or '{}').get('type') in ('income','contra_income','expense')]
+   elif name=='balance':heads=['Kode','Akun','Saldo (Debit - Kredit)'];data=[[x.code,x.name,float(totals[x.id][0]-totals[x.id][1])] for x in coa_rows if json.loads(x.extra or '{}').get('type') in ('asset','contra_asset','liability','equity')]
+   else:heads=['Aktivitas','Jumlah'];data=[['Kas dan Bank - Saldo Bersih',float(sum((D(x.debit)-D(x.credit) for x in js if am[x.account_id].code in ('1000','1010')),ZERO))]]
+ elif name in ('stock','valuation'):
+  heads=['Barang','Gudang','Qty','Nilai'];pairs=sorted({(x.item_id,x.warehouse_id) for x in ss});data=[]
+  for iid,wid in pairs:
+   q=sum((D(x.qty) for x in ss if x.item_id==iid and x.warehouse_id==wid),D(0));v=sum((D(x.value) for x in ss if x.item_id==iid and x.warehouse_id==wid),D(0))
+   data.append([s.get(Master,iid).name,s.get(Master,wid).name,float(q),float(v)])
+ elif name in ('receivables','payables'):
+  code='1100' if name=='receivables' else '2000';heads=['Dokumen','Tanggal','Debit','Kredit'];data=[[docs[x.doc_id].number,x.date,float(x.debit),float(x.credit)] for x in js if am[x.account_id].code==code]
+ elif name=='assets':
+  heads=['Kode','Aset','Harga Perolehan','Residu','Umur (bulan)','Penyusutan/Bulan'];data=[]
+  for a in s.query(Master).filter_by(company_id=cid,kind='asset'):
+   e=json.loads(a.extra or '{}');cost=dec(e.get('cost',0));res=dec(e.get('residual',0));life=int(e.get('months',1) or 1);data.append([a.code,a.name,float(cost),float(res),life,float(max(ZERO,(cost-res)/life))])
+ else:raise HTTPException(404,'Laporan tidak ditemukan')
+ if format=='xlsx':
+  wb=Workbook();ws=wb.active;ws.title='Laporan';ws.append(heads)
+  for r in data:ws.append(r)
+  out=io.BytesIO();wb.save(out);out.seek(0);return StreamingResponse(out,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':f'attachment; filename="{name}.xlsx"'})
+ if format=='pdf':
+  out=io.BytesIO();p=Canvas(out,pagesize=A4);y=800;p.setFont('Helvetica-Bold',15);p.drawString(35,y,'Laporan '+name);y-=30;p.setFont('Helvetica',8)
+  for r in [heads]+data:
+   if y<45:p.showPage();y=800;p.setFont('Helvetica',8)
+   p.drawString(35,y,' | '.join(str(v)[:30] for v in r)[:115]);y-=15
+  p.save();out.seek(0);return StreamingResponse(out,media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="{name}.pdf"'})
+ return page(req,s,'Laporan '+name,report_name=name,heads=heads,rows=data)
+@app.post('/settings')
+def settings(req:Request,theme:str=Form(...),locked_through:str=Form(''),s=Depends(db)):
+ u=user(req,s);c=s.get(Company,u.company_id)
+ if theme not in ('ocean','emerald','dark','sand'):raise HTTPException(400,'Tema tidak dikenal')
+ if locked_through:date.fromisoformat(locked_through)
+ c.theme=theme;c.locked_through=locked_through;s.commit();return go('/')
+@app.post('/assets/{asset_id}/depreciate')
+def depreciate(req:Request,asset_id:int,period:str=Form(...),s=Depends(db)):
+ u=user(req,s);a=master(s,u.company_id,'asset',asset_id)
+ try:period_date=date.fromisoformat(period+'-01')
+ except:raise HTTPException(400,'Periode harus YYYY-MM')
+ e=json.loads(a.extra or '{}');cost=dec(e.get('cost',0));res=dec(e.get('residual',0));life=int(e.get('months',0) or 0)
+ if life<=0 or cost<res:raise HTTPException(400,'Isi extra aset: cost, residual, months yang valid')
+ start=e.get('start',date.today().strftime('%Y-%m'))
+ if period<start:raise HTTPException(400,'Periode sebelum tanggal mulai penyusutan')
+ months=(int(period[:4])-int(start[:4]))*12+int(period[5:7])-int(start[5:7])+1
+ if months<1 or months>life:raise HTTPException(400,'Periode di luar umur manfaat')
+ number=f'DEP-{asset_id}-{period}'
+ if s.query(Document).filter_by(company_id=u.company_id,number=number).first():raise HTTPException(400,'Penyusutan periode ini sudah dibuat')
+ amount=dec((cost-res)/life)
+ if months==life:amount=(cost-res)-amount*(life-1)
+ doc=Document(company_id=u.company_id,kind='depreciation',number=number,date=period_date.isoformat(),memo=f'Penyusutan {a.name} {period}',payload=json.dumps({'amount':str(amount),'asset_id':asset_id}));s.add(doc);s.flush();post(s,doc);s.commit();return go('/reports/assets')
