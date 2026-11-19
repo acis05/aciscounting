@@ -36,3 +36,5 @@ html{font-size:15px;-webkit-text-size-adjust:100%}body{font-family:Inter,ui-sans
 
 /* v0.9: compact, accessible document and role configuration */
 .role-editor{margin:12px 0;border:1px solid #dce8e0;border-radius:10px;padding:12px}.role-editor summary{cursor:pointer;font-weight:700}.role-editor td,.role-editor th{text-align:center;padding:8px}.role-editor td:first-child{text-align:left}.role-editor input[type=checkbox],.print-option input{width:17px;height:17px;min-height:17px;accent-color:#16845b}.print-options{grid-column:1/-1}.print-options-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin:10px 0}.print-option{display:flex;gap:8px;align-items:center;font-size:13px}.print-options-grid label{margin:0}
+
+.transaction-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.transaction-actions form{display:inline;margin:0}.transaction-actions button{white-space:nowrap}

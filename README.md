@@ -89,3 +89,12 @@ Registrasi, halaman master, form transaksi, posting pembelian + PPN, posting pen
 - Hak Akses: tabel `role_rules` dan editor centang izin role per modul/aksi. Pemeriksaan server-side telah diterapkan untuk master data, transaksi, laporan, pengaturan cetakan, audit, dan manajemen akses; audit lebih lanjut atas semua endpoint masih diperlukan.
 
 **Migrasi:** kolom `print_templates.settings` ditambahkan secara aditif pada startup. Lakukan backup PostgreSQL sebelum deploy. Tidak ada reset database. Untuk penggunaan produksi, audit keamanan, pengujian transaksi dan backup/restore tetap diperlukan.
+
+
+## v1.0 — Edit dan Hapus pada Semua Transaksi
+- Tombol Edit dan Hapus pada daftar gabungan, baik Draft maupun Sudah Posting.
+- Edit transaksi Posted membuka kembali transaksi menjadi Draft, menghapus jurnal dan mutasi stok lama, lalu pengguna menyimpan perubahan dan melakukan Posting ulang.
+- Hapus transaksi Posted menghapus jurnal dan mutasi stok yang terkait sebelum menghapus dokumen.
+- Demi keamanan moving-average, transaksi yang memengaruhi stok hanya dapat dibuka/dihapus jika tidak ada mutasi stok sesudahnya; transaksi yang sudah memiliki retur tidak dapat dibuka/dihapus.
+- Transaksi dalam periode terkunci tidak dapat dibuka/dihapus. Aktivitas reopen/delete dicatat pada Audit Trail.
+- Sebelum menggunakan pada database produksi, lakukan backup dan uji skenario transaksi berantai di staging.

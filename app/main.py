@@ -542,10 +542,54 @@ async def document_add(req:Request,kind:str,number:str=Form(...),date_value:str=
  if party_id:master(s,u.company_id,'customer' if kind in ('sale','sale_receipt','sale_return') else 'supplier' if kind in ('purchase','purchase_payment','purchase_return') else 'customer',party_id)
  if warehouse_id:master(s,u.company_id,'warehouse',warehouse_id)
  doc=Document(company_id=u.company_id,kind=kind,number=number.strip()[:60],date=date_value,party_id=party_id or None,warehouse_id=warehouse_id or None,memo=memo[:1000],payload=json.dumps(p));s.add(doc);s.flush();audit(s,u,'create','document',doc.id,doc.number);s.commit();return go('/documents/'+kind)
+def unlock_posted_document(s,u,x):
+ """Safely remove a posted document's effects before editing/deleting it.
+
+ Stock documents can only be reopened when they are the latest stock movement,
+ because the inventory costing engine uses moving-average valuation.
+ """
+ if x.status!='posted':return
+ c=s.get(Company,u.company_id)
+ if c.locked_through and x.date<=c.locked_through:
+  raise HTTPException(400,'Periode sudah dikunci; transaksi tidak dapat diubah')
+ for r in s.query(Document).filter_by(company_id=u.company_id,status='posted').all():
+  if r.id!=x.id and r.kind in ('sale_return','purchase_return'):
+   if int(json.loads(r.payload or '{}').get('source_id') or 0)==x.id:
+    raise HTTPException(400,'Transaksi sudah memiliki retur; batalkan retur terlebih dahulu')
+ own_stocks=s.query(Stock).filter_by(company_id=u.company_id,doc_id=x.id).all()
+ if own_stocks:
+  latest_id=s.query(func.max(Stock.id)).filter_by(company_id=u.company_id).scalar()
+  if latest_id and latest_id>max(row.id for row in own_stocks):
+   raise HTTPException(400,'Ada mutasi stok setelah transaksi ini; ubah/hapus transaksi stok terbaru terlebih dahulu')
+  # Do not let stock reversals leave any warehouse with negative quantities.
+  keys={(row.item_id,row.warehouse_id) for row in own_stocks}
+  for item_id,warehouse_id in keys:
+   current,_=balances(s,u.company_id,item_id,warehouse_id)
+   reversing=sum((D(row.qty) for row in own_stocks if row.item_id==item_id and row.warehouse_id==warehouse_id),D(0))
+   if current-reversing<0:
+    raise HTTPException(400,'Tidak bisa membatalkan posting: stok gudang menjadi negatif')
+ journal_ids=[row.id for row in s.query(Journal.id).filter_by(company_id=u.company_id,doc_id=x.id).all()]
+ if journal_ids:s.query(JournalParty).filter(JournalParty.company_id==u.company_id,JournalParty.journal_id.in_(journal_ids)).delete(synchronize_session=False)
+ s.query(Journal).filter_by(company_id=u.company_id,doc_id=x.id).delete(synchronize_session=False)
+ s.query(Stock).filter_by(company_id=u.company_id,doc_id=x.id).delete(synchronize_session=False)
+ x.status='draft'
+
+@app.post('/documents/{kind}/{did}/reopen')
+def document_reopen(req:Request,kind:str,did:int,s=Depends(db)):
+ u=user(req,s);authorize(s,u,'write','documents');x=owned(s,Document,did,u.company_id)
+ if x.kind!=kind:raise HTTPException(404)
+ if x.status=='posted':
+  try:
+   unlock_posted_document(s,u,x)
+   audit(s,u,'reopen','document',x.id,x.number)
+   s.commit()
+  except:s.rollback();raise
+ return go('/documents/'+kind+'?view=list#transaction-list')
+
 @app.post('/documents/{kind}/{did}/edit')
 async def document_edit(req:Request,kind:str,did:int,number:str=Form(...),date_value:str=Form(...,alias='date'),party_id:int=Form(0),warehouse_id:int=Form(0),memo:str=Form(''),payload:str=Form('{}'),s=Depends(db)):
  u=user(req,s);authorize(s,u,'write','documents');x=owned(s,Document,did,u.company_id)
- if x.kind!=kind or x.status!='draft':raise HTTPException(400,'Hanya draft yang bisa diedit')
+ if x.kind!=kind or x.status!='draft':raise HTTPException(400,'Klik Edit pada transaksi terposting untuk membuka kembali sebagai Draft terlebih dahulu')
  try:date.fromisoformat(date_value)
  except:raise HTTPException(400,'Tanggal tidak valid')
  p=await form_payload(req,s,u.company_id,kind)
@@ -555,8 +599,13 @@ async def document_edit(req:Request,kind:str,did:int,number:str=Form(...),date_v
 @app.post('/documents/{kind}/{did}/delete')
 def document_delete(req:Request,kind:str,did:int,s=Depends(db)):
  u=user(req,s);authorize(s,u,'write','documents');x=owned(s,Document,did,u.company_id)
- if x.kind!=kind or x.status!='draft':raise HTTPException(400,'Hanya draft dapat dihapus')
- audit(s,u,'delete','document',x.id,x.number);s.delete(x);s.commit();return go('/documents/'+kind)
+ if x.kind!=kind:raise HTTPException(404)
+ try:
+  if x.status=='posted':unlock_posted_document(s,u,x)
+  audit(s,u,'delete','document',x.id,x.number)
+  s.delete(x);s.commit()
+ except:s.rollback();raise
+ return go('/transactions')
 @app.post('/documents/{kind}/{did}/post')
 def document_post(req:Request,kind:str,did:int,s=Depends(db)):
  u=user(req,s);authorize(s,u,'post','documents');x=owned(s,Document,did,u.company_id)
