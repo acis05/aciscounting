@@ -39,7 +39,7 @@ class Journal(Base):
 class Stock(Base):
  __tablename__='stocks';id=Column(Integer,primary_key=True);company_id=Column(Integer,index=True);doc_id=Column(Integer,ForeignKey('documents.id'),index=True);date=Column(String(10));item_id=Column(Integer);warehouse_id=Column(Integer);qty=Column(Numeric(18,4),default=0);value=Column(Numeric(18,2),default=0);unit_cost=Column(Numeric(18,4),default=0)
 Base.metadata.create_all(engine)
-app=FastAPI(title='aciscounting.id',version='0.4.0')
+app=FastAPI(title='aciscounting.id',version='0.6.0')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SECRET_KEY','DEV_ONLY_CHANGE_THIS_SECRET'),https_only=os.getenv('COOKIE_SECURE','false').lower()=='true',same_site='lax')
 ROOT=os.path.dirname(__file__);tplfilter=lambda v: json.loads(v or '{}');app.mount('/static',StaticFiles(directory=ROOT+'/static'),name='static');tpl=Jinja2Templates(directory=ROOT+'/templates');tpl.env.filters['from_json']=tplfilter
 @app.exception_handler(HTTPException)
@@ -285,13 +285,19 @@ def master_delete(req:Request,kind:str,mid:int,s=Depends(db)):
  if kind=='item' and s.query(Stock).filter_by(company_id=u.company_id,item_id=mid).first():raise HTTPException(400,'Barang sudah memiliki mutasi')
  if s.query(Document).filter_by(company_id=u.company_id,party_id=mid).first():raise HTTPException(400,'Master digunakan dokumen')
  s.delete(x);s.commit();return go('/masters/'+kind)
+@app.get('/transactions')
+def transactions_overview(req:Request,s=Depends(db)):
+ u=user(req,s)
+ docs=s.query(Document).filter_by(company_id=u.company_id).order_by(Document.date.desc(),Document.id.desc()).limit(500).all()
+ return page(req,s,'Semua Transaksi',transaction_overview=docs,transaction_names={k:v for k,v in KINDS.items() if k!='depreciation'})
+
 @app.get('/documents/{kind}')
-def documents(req:Request,kind:str,s=Depends(db)):
+def documents(req:Request,kind:str,view:str='',s=Depends(db)):
  u=user(req,s)
  if kind not in KINDS:raise HTTPException(404)
  items=s.query(Document).filter_by(company_id=u.company_id,kind=kind).order_by(Document.id.desc()).all()
  lists={k:s.query(Master).filter_by(company_id=u.company_id,kind=k).all() for k in ('customer','supplier','item','warehouse','coa','asset')}
- return page(req,s,KINDS[kind],kind=kind,items=items,lists=lists,kind_label=KINDS[kind],invoice_sources=s.query(Document).filter_by(company_id=u.company_id,kind=('sale' if kind=='sale_return' else 'purchase'),status='posted').all() if kind in ('sale_return','purchase_return') else [],doc_details={d.id:json.loads(d.payload) for d in items})
+ return page(req,s,KINDS[kind],kind=kind,items=items,lists=lists,kind_label=KINDS[kind],list_only=(view=='list'),invoice_sources=s.query(Document).filter_by(company_id=u.company_id,kind=('sale' if kind=='sale_return' else 'purchase'),status='posted').all() if kind in ('sale_return','purchase_return') else [],doc_details={d.id:json.loads(d.payload) for d in items})
 LINE_KINDS=('sale','purchase','sale_return','purchase_return')
 async def form_payload(req,s,cid,kind):
  form=await req.form()

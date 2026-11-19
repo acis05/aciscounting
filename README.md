@@ -42,3 +42,12 @@ Registrasi, halaman master, form transaksi, posting pembelian + PPN, posting pen
 - Error validasi dari formulir ditampilkan sebagai halaman penjelasan, bukan JSON mentah (respons API yang meminta JSON tetap JSON).
 
 **Perhatian:** Lakukan backup PostgreSQL sebelum deploy. Uji data historis dan perhitungan pajak dengan akuntan sebelum penggunaan produksi. Dokumen cetak belum termasuk nomor seri pajak, tanda tangan digital, alamat lengkap, atau format faktur pajak resmi.
+
+
+## v0.6 — navigasi v0.4 dipertahankan
+- Sidebar accordion dan submenu tetap seperti v0.4 (bukan panel pop-up v0.5).
+- Semua Transaksi menampilkan daftar lintas modul.
+- Tiap menu transaksi memiliki tab Input dan Daftar, termasuk edit/hapus draft.
+- Faktur penjualan yang telah diposting: tombol Cetak Faktur dan Cetak Surat Jalan (tanpa harga).
+- Transaksi posting terkunci; tidak bisa edit/hapus langsung agar jurnal dan stok tidak rusak.
+- Lakukan backup database sebelum deploy.
