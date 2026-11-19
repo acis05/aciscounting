@@ -42,3 +42,14 @@ Registrasi, halaman master, form transaksi, posting pembelian + PPN, posting pen
 - Error validasi dari formulir ditampilkan sebagai halaman penjelasan, bukan JSON mentah (respons API yang meminta JSON tetap JSON).
 
 **Perhatian:** Lakukan backup PostgreSQL sebelum deploy. Uji data historis dan perhitungan pajak dengan akuntan sebelum penggunaan produksi. Dokumen cetak belum termasuk nomor seri pajak, tanda tangan digital, alamat lengkap, atau format faktur pajak resmi.
+
+## v0.5 — Navigasi dan daftar transaksi (19 November 2026)
+
+- Sidebar ringkas: klik kategori membuka panel mengambang berisi grid ikon submenu ke samping, bukan dropdown memanjang.
+- Mobile: panel ikon 2 kolom, tablet 3 kolom, desktop 4 kolom. Klik di luar panel atau Escape untuk menutup.
+- Menu **Semua Transaksi** di sidebar menampilkan daftar lintas jenis transaksi dan tautan menuju daftar per jenis.
+- Setiap halaman input transaksi mempunyai tab **Input** dan **Daftar**, dengan tombol **Edit Draft**, **Hapus**, dan **Posting** untuk dokumen draft. Dokumen posted terkunci sesuai audit trail akuntansi.
+- **Faktur Penjualan**: tombol **Cetak Faktur** dan **Cetak Surat Jalan** muncul pada baris faktur yang sudah diposting. Surat jalan tidak menampilkan harga.
+- Tidak ada perubahan skema database, environment variables Railway tetap sama. Backup PostgreSQL sebelum update.
+
+Catatan: menu dan tata letak baru diuji secara otomatis melalui HTML/TestClient, belum diuji visual pada perangkat fisik. Perbaikan ini tidak mengubah engine jurnal v0.4.
