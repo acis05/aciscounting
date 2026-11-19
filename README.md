@@ -79,3 +79,13 @@ Registrasi, halaman master, form transaksi, posting pembelian + PPN, posting pen
 3. Tabel baru (`activities`, `member_roles`, `print_templates`, `journal_parties`) dibuat otomatis oleh SQLAlchemy. Perubahan tipe akun lama dilakukan saat mengakses master/dokumen.
 4. Uji jurnal barang, jasa, diskon, retur, buku besar pembantu, dan hak akses dengan data percobaan **sebelum** digunakan untuk pencatatan nyata.
 5. Fitur masih **beta**; belum diaudit kepatuhan PSAK, keamanan, kontrol akses, maupun kesesuaian pajak.
+
+## Pembaruan v0.9 (beta)
+
+- Penyesuaian persediaan: pilihan **Akun Penyesuaian** untuk jurnal lawan, hanya item tipe Barang; akun persediaan mengikuti master barang. Akun kas/bank/piutang/hutang tidak dapat dipilih sebagai akun penyesuaian.
+- Buku Kas Bank: filter per akun Kas/Bank, saldo awal, mutasi debit/kredit (masuk/keluar), saldo berjalan, saldo akhir, ekspor Excel/PDF.
+- Valuasi Persediaan: total per barang dari seluruh gudang (tanpa kolom gudang), tampilan angka lokal 2 desimal.
+- Desain Cetakan: checkbox komponen, header/footer tambahan, warna aksen, serta halaman pratinjau dengan data contoh. Pilihan yang sudah diterapkan pada PDF mencakup logo, perusahaan, judul, nomor, tanggal, pelanggan, kuantitas, harga, PPN, total, tanda tangan dan footer. Beberapa pilihan tambahan (alamat, SKU, satuan, diskon, warna aksen) masih untuk pengembangan berikutnya dan belum mengubah PDF akhir.
+- Hak Akses: tabel `role_rules` dan editor centang izin role per modul/aksi. Pemeriksaan server-side telah diterapkan untuk master data, transaksi, laporan, pengaturan cetakan, audit, dan manajemen akses; audit lebih lanjut atas semua endpoint masih diperlukan.
+
+**Migrasi:** kolom `print_templates.settings` ditambahkan secara aditif pada startup. Lakukan backup PostgreSQL sebelum deploy. Tidak ada reset database. Untuk penggunaan produksi, audit keamanan, pengujian transaksi dan backup/restore tetap diperlukan.
