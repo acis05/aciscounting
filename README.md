@@ -59,3 +59,23 @@ Registrasi, halaman master, form transaksi, posting pembelian + PPN, posting pen
 - Daftar master dibuat lebih padat (baris, font, dan input lebih kecil).
 - Format laporan bersifat **PSAK-inspired**, bukan sertifikasi kepatuhan PSAK. Arus kas belum dapat memisahkan investasi/pendanaan otomatis dari jurnal manual; cek catatan laporan.
 - Tidak ada migrasi skema database dalam v0.7. Backup PostgreSQL sebelum deploy.
+
+## Update v0.8 — Fondasi akun, dokumen, audit dan pengguna
+
+- COA kini mendukung jenis **Kas, Bank, Piutang, Hutang**. Akun sistem lama dimigrasikan otomatis saat membuka halaman COA/dokumen. Kode akun sistem boleh diubah, sementara identitas internal tetap dipertahankan.
+- Kas/Bank masuk dan keluar dapat memilih akun Kas/Bank dari COA, termasuk beberapa akun berbeda.
+- Barang dan jasa dapat memiliki pemetaan akun persediaan/beban, HPP, dan pendapatan. Pembelian jasa langsung dicatat ke akun beban, tanpa mutasi stok. Pembelian barang memakai akun persediaan per item, dan penjualan memakai akun pendapatan, HPP, dan persediaan per item.
+- Faktur pembelian memilih akun bertipe Hutang, faktur penjualan memilih akun bertipe Piutang. Diskon **nominal per baris** mengurangi nilai sebelum PPN.
+- Jurnal manual dapat menautkan pelanggan/pemasok pada akun Piutang/Hutang; menu **Buku Besar Pembantu** menampilkan saldo per akun dan pihak. Satu pihak boleh menggunakan beberapa akun.
+- **Desain Cetakan** menyimpan judul, ukuran kertas A4/A5/Letter, logo PNG/JPEG (maks. 250 KB), dan catatan kaki per jenis dokumen. Ini pengaturan tata letak dasar, **belum editor drag-and-drop**.
+- **Audit Trail** merekam tambah/edit/hapus master, tambah/edit/hapus/posting draft, pengelolaan pengguna dan template. Log belum merekam seluruh perubahan lama sebelum v0.8 dan belum memiliki diff before/after rinci.
+- **Hak Akses** menambah pengguna dalam perusahaan dengan role owner, admin, accounting, sales, purchasing, viewer. Peran dasar sudah memeriksa aksi tulis/posting di backend, tetapi **pembatasan per modul untuk sales/purchasing dan perlindungan seluruh endpoint belum lengkap**. Jangan anggap ini sistem otorisasi produksi yang sudah diaudit.
+- Sidebar lama v0.4/v0.6 dipertahankan; menu baru ditambahkan sebagai tautan sederhana.
+
+### Perhatian sebelum deploy
+
+1. **Backup database PostgreSQL** sebelum update.
+2. Deploy seluruh isi ZIP ke GitHub/Railway dengan DATABASE_URL dan SECRET_KEY lama. Tidak perlu menghapus database.
+3. Tabel baru (`activities`, `member_roles`, `print_templates`, `journal_parties`) dibuat otomatis oleh SQLAlchemy. Perubahan tipe akun lama dilakukan saat mengakses master/dokumen.
+4. Uji jurnal barang, jasa, diskon, retur, buku besar pembantu, dan hak akses dengan data percobaan **sebelum** digunakan untuk pencatatan nyata.
+5. Fitur masih **beta**; belum diaudit kepatuhan PSAK, keamanan, kontrol akses, maupun kesesuaian pajak.

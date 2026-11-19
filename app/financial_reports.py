@@ -66,8 +66,8 @@ def report_model(name,accounts,journals,documents,start,end,account_id=None):
   add('LABA (RUGI) PERIODE BERJALAN',gross-expenses,kind='grand')
   notes.append('Klasifikasi HPP memakai kode akun 5xxx dan 1201; periksa pemetaan COA jika kode akun diubah.')
  elif name=='balance':
-  assets=group('ASET',('asset','contra_asset'),'debit',all_t)
-  liabilities=group('LIABILITAS',('liability',),'credit',all_t)
+  assets=group('ASET',('asset','contra_asset','cash','bank','receivable'),'debit',all_t)
+  liabilities=group('LIABILITAS',('liability','payable'),'credit',all_t)
   equity=group('EKUITAS',('equity',),'credit',all_t)
   profit=Z
   for a in accounts:
@@ -96,7 +96,7 @@ def report_model(name,accounts,journals,documents,start,end,account_id=None):
   notes.append('Saldo debit positif; saldo kredit ditampilkan negatif pada kolom saldo berjalan.')
  elif name=='cashflow':
   # Direct method: cash movement grouped by document origin. Mixed journal transactions are kept in a separate, explicit group.
-  cash_ids={a.id for a in accounts if a.code in ('1000','1010') or __import__('json').loads(a.extra or '{}').get('system_code') in ('1000','1010')}
+  cash_ids={a.id for a in accounts if __import__('json').loads(a.extra or '{}').get('type') in ('cash','bank') or a.code in ('1000','1010') or __import__('json').loads(a.extra or '{}').get('system_code') in ('1000','1010')}
   opening=sum((Decimal(j.debit)-Decimal(j.credit) for j in entries if j.account_id in cash_ids and j.date<start),Z)
   movements=defaultdict(lambda:Z)
   kind_map={'cash_in':('Operasi','Penerimaan kas lainnya'),'cash_out':('Operasi','Pengeluaran kas lainnya'),'bank_in':('Operasi','Penerimaan bank lainnya'),'bank_out':('Operasi','Pengeluaran bank lainnya'),'sale_receipt':('Operasi','Penerimaan dari pelanggan'),'purchase_payment':('Operasi','Pembayaran kepada pemasok')}
