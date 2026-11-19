@@ -51,3 +51,11 @@ Registrasi, halaman master, form transaksi, posting pembelian + PPN, posting pen
 - Faktur penjualan yang telah diposting: tombol Cetak Faktur dan Cetak Surat Jalan (tanpa harga).
 - Transaksi posting terkunci; tidak bisa edit/hapus langsung agar jurnal dan stok tidak rusak.
 - Lakukan backup database sebelum deploy.
+
+## v0.7 — Penyajian laporan dan master data
+- Menu/sidebar v0.4/v0.6 tidak diubah.
+- Laba Rugi, Neraca, Buku Besar, dan Arus Kas: filter tanggal, subtotal, saldo berjalan, catatan, ekspor Excel dan PDF dengan tabel terformat.
+- Semua laporan lainnya tetap mempunyai opsi ekspor Excel/PDF dari v0.6.
+- Daftar master dibuat lebih padat (baris, font, dan input lebih kecil).
+- Format laporan bersifat **PSAK-inspired**, bukan sertifikasi kepatuhan PSAK. Arus kas belum dapat memisahkan investasi/pendanaan otomatis dari jurnal manual; cek catatan laporan.
+- Tidak ada migrasi skema database dalam v0.7. Backup PostgreSQL sebelum deploy.

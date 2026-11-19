@@ -15,6 +15,7 @@ from reportlab.pdfgen.canvas import Canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import simpleSplit
 from html import escape
+from app.financial_reports import report_model, export_xlsx, export_pdf
 
 D=Decimal
 ZERO=D('0.00')
@@ -39,7 +40,7 @@ class Journal(Base):
 class Stock(Base):
  __tablename__='stocks';id=Column(Integer,primary_key=True);company_id=Column(Integer,index=True);doc_id=Column(Integer,ForeignKey('documents.id'),index=True);date=Column(String(10));item_id=Column(Integer);warehouse_id=Column(Integer);qty=Column(Numeric(18,4),default=0);value=Column(Numeric(18,2),default=0);unit_cost=Column(Numeric(18,4),default=0)
 Base.metadata.create_all(engine)
-app=FastAPI(title='aciscounting.id',version='0.6.0')
+app=FastAPI(title='aciscounting.id',version='0.7.0')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SECRET_KEY','DEV_ONLY_CHANGE_THIS_SECRET'),https_only=os.getenv('COOKIE_SECURE','false').lower()=='true',same_site='lax')
 ROOT=os.path.dirname(__file__);tplfilter=lambda v: json.loads(v or '{}');app.mount('/static',StaticFiles(directory=ROOT+'/static'),name='static');tpl=Jinja2Templates(directory=ROOT+'/templates');tpl.env.filters['from_json']=tplfilter
 @app.exception_handler(HTTPException)
@@ -405,8 +406,24 @@ def print_sale(req:Request,did:int,print_type:str,s=Depends(db)):
  return StreamingResponse(output,media_type='application/pdf',headers={'Content-Disposition':f'inline; filename="{filename}"'})
 
 @app.get('/reports/{name}')
-def report(req:Request,name:str,format:str='html',s=Depends(db)):
+def report(req:Request,name:str,format:str='html',start:str='',end:str='',account_id:int=0,s=Depends(db)):
  u=user(req,s);cid=u.company_id
+ if name in ('profit','balance','ledger','cashflow'):
+  today=date.today().isoformat();end=end or today;start=start or (today[:4]+'-01-01')
+  try:date.fromisoformat(start);date.fromisoformat(end)
+  except ValueError:raise HTTPException(400,'Format tanggal tidak valid')
+  accounts=s.query(Master).filter_by(company_id=cid,kind='coa').all()
+  journals=s.query(Journal).filter_by(company_id=cid).order_by(Journal.date,Journal.id).all()
+  documents=s.query(Document).filter_by(company_id=cid).all()
+  if account_id and not any(a.id==account_id for a in accounts):raise HTTPException(404,'Akun tidak ditemukan')
+  rows,notes=report_model(name,accounts,journals,documents,start,end,account_id or None)
+  titles={'profit':'Laporan Laba Rugi','balance':'Laporan Posisi Keuangan (Neraca)','ledger':'Buku Besar','cashflow':'Laporan Arus Kas'}
+  title=titles[name];period=('Per '+end if name=='balance' else 'Periode '+start+' s.d. '+end)
+  company=s.get(Company,cid).name
+  if format=='xlsx':return export_xlsx(title,company,period,rows,notes,name)
+  if format=='pdf':return export_pdf(title,company,period,rows,notes,name)
+  if format!='html':raise HTTPException(400,'Format ekspor tidak dikenal')
+  return page(req,s,title,report_name=name,financial_rows=rows,financial_notes=notes,report_start=start,report_end=end,report_account_id=account_id,report_accounts=sorted(accounts,key=lambda x:x.code),report_period=period)
  coa_rows=s.query(Master).filter_by(company_id=cid,kind='coa').all();am={x.id:x for x in coa_rows};js=s.query(Journal).filter_by(company_id=cid).order_by(Journal.date,Journal.id).all();ss=s.query(Stock).filter_by(company_id=cid).order_by(Stock.date,Stock.id).all();docs={x.id:x for x in s.query(Document).filter_by(company_id=cid)}
  data=[];heads=[]
  if name in ('journals','ledger','trial','profit','balance','cashflow','bank'):
