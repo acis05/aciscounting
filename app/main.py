@@ -61,7 +61,7 @@ with engine.begin() as connection:
    connection.execute(sqltext(f'ALTER TABLE {table} ADD COLUMN {col} {sql}'))
  if 'print_templates' in inspect(connection).get_table_names() and 'settings' not in {c['name'] for c in inspect(connection).get_columns('print_templates')}:
   connection.execute(sqltext("ALTER TABLE print_templates ADD COLUMN settings TEXT DEFAULT '{}'"))
-app=FastAPI(title='aciscounting.id',version='2.0.0')
+app=FastAPI(title='aciscounting.id',version='2.1.0')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SECRET_KEY','DEV_ONLY_CHANGE_THIS_SECRET'),https_only=os.getenv('COOKIE_SECURE','false').lower()=='true',same_site='lax')
 ROOT=os.path.dirname(__file__);tplfilter=lambda v: json.loads(v or '{}');app.mount('/static',StaticFiles(directory=ROOT+'/static'),name='static');tpl=Jinja2Templates(directory=ROOT+'/templates');tpl.env.filters['from_json']=tplfilter
 @app.exception_handler(HTTPException)
@@ -243,8 +243,8 @@ def post(s,doc):
   latest=s.query(func.max(Stock.date)).filter_by(company_id=doc.company_id).scalar()
   if latest and doc.date<latest:raise HTTPException(400,'Transaksi stok tidak boleh mundur tanggal; gunakan tanggal terkini')
  p=json.loads(doc.payload);amount=dec(p.get('amount',0));qty=D(str(p.get('qty',0)));item=int(p.get('item_id') or 0);wh=int(doc.warehouse_id or 0);k=doc.kind;E=[]
- if k=='cash_in':E=[(account_for(s,doc.company_id,p.get('cash_bank_account','1000'),('cash',)).code,amount,0),(p.get('account','4000'),0,amount)]
- elif k=='cash_out':E=[(p.get('account','6000'),amount,0),(account_for(s,doc.company_id,p.get('cash_bank_account','1000'),('cash',)).code,0,amount)]
+ if k=='cash_in':E=[(account_for(s,doc.company_id,p.get('cash_bank_account','1000'),('cash','bank')).code,amount,0),(p.get('account','4000'),0,amount)]
+ elif k=='cash_out':E=[(p.get('account','6000'),amount,0),(account_for(s,doc.company_id,p.get('cash_bank_account','1000'),('cash','bank')).code,0,amount)]
  elif k=='bank_in':E=[(account_for(s,doc.company_id,p.get('cash_bank_account','1010'),('bank',)).code,amount,0),(p.get('account','4000'),0,amount)]
  elif k=='bank_out':E=[(p.get('account','6000'),amount,0),(account_for(s,doc.company_id,p.get('cash_bank_account','1010'),('bank',)).code,0,amount)]
  elif k in ('sale','purchase','sale_return','purchase_return'):
@@ -365,7 +365,7 @@ def post(s,doc):
     master(s,doc.company_id,'customer' if account_type(acc)=='receivable' else 'supplier',party)
  lines(s,doc,E);doc.status='posted'
 
-KINDS={'cash_in':'Kas Masuk','cash_out':'Kas Keluar','bank_in':'Bank Masuk','bank_out':'Bank Keluar','sale':'Faktur Penjualan','sale_receipt':'Penerimaan Penjualan','sale_return':'Retur Penjualan','purchase':'Faktur Pembelian','purchase_payment':'Pembayaran Pembelian','purchase_return':'Retur Pembelian','transfer':'Transfer Gudang','adjust':'Penyesuaian Persediaan','journal':'Jurnal Umum'}
+KINDS={'cash_in':'Kas/Bank Masuk','cash_out':'Kas/Bank Keluar','bank_in':'Bank Masuk','bank_out':'Bank Keluar','sale':'Faktur Penjualan','sale_receipt':'Penerimaan Penjualan','sale_return':'Retur Penjualan','purchase':'Faktur Pembelian','purchase_payment':'Pembayaran Pembelian','purchase_return':'Retur Pembelian','transfer':'Transfer Gudang','adjust':'Penyesuaian Persediaan','journal':'Jurnal Umum'}
 MASTER_KINDS={'coa':'COA','customer':'Pelanggan','supplier':'Pemasok','item':'Barang / Jasa','warehouse':'Gudang','unit':'Satuan','salesman':'Salesman'}
 @app.get('/')
 def home(req:Request,s=Depends(db)):
@@ -559,13 +559,116 @@ def login(req:Request,email:str=Form(...),password:str=Form(...),s=Depends(db)):
  req.session.clear();req.session['uid']=u.id;return go('/account/password' if u.must_change_password else '/')
 @app.post('/logout')
 def logout(req:Request):req.session.clear();return go('/login')
+# Presets are recommendations; existing accounts are never overwritten.
+COA_PRESETS={
+ 'general':('Umum / General', [('1020','Bank Operasional','bank'),('4200','Pendapatan Lain-lain','income'),('6200','Beban Administrasi','expense'),('6300','Beban Listrik dan Air','expense')]),
+ 'dagang':('Perdagangan / Toko', [('1110','Piutang Kartu / Marketplace','receivable'),('1210','Persediaan Barang Dagang','asset'),('4100','Penjualan Barang Dagang','income'),('5010','HPP Barang Dagang','cogs'),('6110','Beban Sewa Toko','expense'),('6120','Beban Pengiriman','expense')]),
+ 'jasa':('Usaha Jasa', [('4110','Pendapatan Jasa','income'),('1120','Piutang Jasa','receivable'),('6210','Beban Tenaga Kerja','expense'),('6220','Beban Perlengkapan','expense'),('6230','Beban Transportasi','expense')]),
+ 'kontraktor':('Kontraktor / Proyek', [('1130','Piutang Termin Proyek','receivable'),('1230','Pekerjaan Dalam Proses','asset'),('2110','Uang Muka Pelanggan','liability'),('4120','Pendapatan Proyek','income'),('5020','HPP Material Proyek','cogs'),('5030','HPP Subkontraktor','cogs'),('6240','Beban Operasional Proyek','expense')]),
+ 'kuliner':('Kuliner / Restoran', [('1220','Persediaan Bahan Baku','asset'),('4130','Penjualan Makanan dan Minuman','income'),('5040','HPP Bahan Baku','cogs'),('6250','Beban Kemasan','expense'),('6260','Beban Gas dan Dapur','expense')]),
+ 'manufaktur':('Produksi / Manufaktur', [('1240','Bahan Baku','asset'),('1250','Barang Dalam Proses','asset'),('1260','Barang Jadi','asset'),('4140','Penjualan Produk Jadi','income'),('5050','HPP Produksi','cogs'),('6270','Beban Pemeliharaan Mesin','expense')]),
+ 'online':('Online Shop / Marketplace', [('1140','Piutang Marketplace','receivable'),('4150','Penjualan Marketplace','income'),('5060','HPP Produk Online','cogs'),('6280','Beban Admin Marketplace','expense'),('6290','Beban Iklan Digital','expense')]),
+ 'profesional':('Konsultan / Profesional', [('4160','Pendapatan Konsultasi','income'),('4170','Pendapatan Retainer','income'),('6310','Beban Software dan Langganan','expense'),('6320','Beban Honor Tenaga Ahli','expense')]),
+ 'properti':('Sewa Properti', [('1270','Uang Muka Sewa Dibayar','asset'),('2120','Pendapatan Sewa Diterima Dimuka','liability'),('4180','Pendapatan Sewa','income'),('6330','Beban Pemeliharaan Properti','expense')]),
+}
+
+@app.post('/masters/coa/preset')
+async def apply_coa_preset(req:Request,s=Depends(db)):
+ u=user(req,s);authorize(s,u,'write','masters')
+ form=await req.form();key=str(form.get('preset',''))
+ if key not in COA_PRESETS:raise HTTPException(400,'Jenis usaha tidak valid')
+ ensure_system_coas(s,u.company_id)
+ existing={a.code for a in s.query(Master).filter_by(company_id=u.company_id,kind='coa').all()}
+ added=0
+ for code,name,typ in COA_PRESETS[key][1]:
+  if code in existing:continue
+  s.add(Master(company_id=u.company_id,kind='coa',code=code,name=name,extra=json.dumps({'type':typ})));added+=1
+ audit(s,u,'preset','coa',0,f'{key}: {added} akun baru');s.commit()
+ return go('/masters/coa?preset_added='+str(added))
+
+IMPORT_DOCUMENT_HEADERS={'cash_in':['nomor','tanggal','nominal','akun_kas_bank','akun_lawan','keterangan'],'cash_out':['nomor','tanggal','nominal','akun_kas_bank','akun_lawan','keterangan'],'journal':['nomor','tanggal','akun','debit','kredit','keterangan']}
+def transaction_template(kind):
+ wb=Workbook();ws=wb.active;ws.title='Data Transaksi';ws.append(IMPORT_DOCUMENT_HEADERS[kind])
+ if kind=='journal':
+  ws.append(['JU-001','2026-11-21','6000',100000,0,'Beban operasional']);ws.append(['JU-001','2026-11-21','1000',0,100000,'Beban operasional'])
+ else:ws.append(['KB-001','2026-11-21',100000,'1000','4000' if kind=='cash_in' else '6000','Contoh transaksi'])
+ ws.freeze_panes='A2'
+ for c in ws[1]:c.font=Font(bold=True,color='FFFFFF');c.fill=PatternFill('solid',fgColor='176A47')
+ for col in ws.columns:ws.column_dimensions[col[0].column_letter].width=23
+ info=wb.create_sheet('Petunjuk');info.append(['HAPUS baris contoh sebelum impor data sendiri.']);info.append(['Simpan sebagai XLSX; maksimal 2 MB dan 1000 baris.']);info.append(['Nomor harus unik. Jurnal: nomor sama untuk beberapa baris debit/kredit, jumlah harus seimbang.']);info.append(['Semua dokumen hasil impor berstatus DRAFT dan harus diposting secara manual.']);info.append(['Tanggal: YYYY-MM-DD. Akun kas/bank wajib bertipe cash atau bank.']);info.append(['Akun piutang/hutang pada impor jurnal belum didukung karena membutuhkan relasi pelanggan/pemasok.']);info.column_dimensions['A'].width=115
+ b=io.BytesIO();wb.save(b);return b.getvalue()
+
+@app.get('/documents/{kind}/template.xlsx')
+def document_excel_template(req:Request,kind:str,s=Depends(db)):
+ u=user(req,s);authorize(s,u,'read','documents')
+ if kind not in IMPORT_DOCUMENT_HEADERS:raise HTTPException(404)
+ if not is_pro(s,u.company_id):raise HTTPException(403,'Impor Excel transaksi hanya tersedia pada PRO')
+ return Response(transaction_template(kind),media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':f'attachment; filename="template_{kind}.xlsx"'})
+
+@app.post('/documents/{kind}/import')
+async def import_documents(req:Request,kind:str,file:UploadFile=File(...),s=Depends(db)):
+ u=user(req,s);authorize(s,u,'write','documents')
+ if kind not in IMPORT_DOCUMENT_HEADERS:raise HTTPException(404)
+ if not is_pro(s,u.company_id):raise HTTPException(403,'Impor Excel transaksi hanya tersedia pada PRO')
+ if not (file.filename or '').lower().endswith('.xlsx'):raise HTTPException(400,'Gunakan berkas XLSX')
+ data=await file.read(2*1024*1024+1)
+ if len(data)>2*1024*1024:raise HTTPException(400,'Ukuran maksimal 2 MB')
+ try:wb=load_workbook(io.BytesIO(data),read_only=True,data_only=True);ws=wb.active
+ except Exception:raise HTTPException(400,'Berkas Excel tidak valid')
+ rows=ws.iter_rows(values_only=True);header=next(rows,None)
+ if not header or [str(v or '').strip().lower() for v in header[:len(IMPORT_DOCUMENT_HEADERS[kind])]]!=IMPORT_DOCUMENT_HEADERS[kind]:raise HTTPException(400,'Kolom Excel tidak cocok dengan template')
+ parsed=[]
+ for index,row in enumerate(rows,2):
+  if not any(v is not None and str(v).strip() for v in row):continue
+  if len(parsed)>=1000:raise HTTPException(400,'Maksimal 1000 baris')
+  values=list(row[:len(IMPORT_DOCUMENT_HEADERS[kind])]);values+=['']*(len(IMPORT_DOCUMENT_HEADERS[kind])-len(values))
+  number=str(values[0] or '').strip();dt=values[1]
+  if isinstance(dt,datetime):dt=dt.date().isoformat()
+  elif isinstance(dt,date):dt=dt.isoformat()
+  else:dt=str(dt or '').strip()
+  try:date.fromisoformat(dt)
+  except:raise HTTPException(400,f'Baris {index}: tanggal harus YYYY-MM-DD')
+  if not number or len(number)>60:raise HTTPException(400,f'Baris {index}: nomor tidak valid')
+  parsed.append((index,number,dt,values))
+ if not parsed:raise HTTPException(400,'Excel tidak berisi data')
+ existing={v[0] for v in s.query(Document.number).filter_by(company_id=u.company_id).all()}
+ prepared=[]
+ if kind=='journal':
+  grouped={}
+  for idx,num,dt,v in parsed:
+   account=str(v[2] or '').strip();a=account_for(s,u.company_id,account)
+   if account_type(a) in ('receivable','payable'):raise HTTPException(400,f'Baris {idx}: akun piutang/hutang memerlukan pelanggan/pemasok; masukkan manual')
+   dr=dec(v[3]);cr=dec(v[4])
+   if dr<0 or cr<0 or (dr>0 and cr>0) or (dr==0 and cr==0):raise HTTPException(400,f'Baris {idx}: debit/kredit tidak valid')
+   g=grouped.setdefault(num,{'date':dt,'memo':str(v[5] or '')[:1000],'entries':[]})
+   if g['date']!=dt:raise HTTPException(400,f'Baris {idx}: tanggal berbeda dalam jurnal {num}')
+   g['entries'].append({'account':account,'debit':str(dr),'credit':str(cr),'party_id':0})
+  for num,g in grouped.items():
+   if num in existing:raise HTTPException(400,f'Nomor {num} sudah digunakan')
+   if sum((dec(e['debit'])-dec(e['credit']) for e in g['entries']),ZERO)!=0:raise HTTPException(400,f'Jurnal {num} tidak seimbang')
+   if len(g['entries'])<2:raise HTTPException(400,f'Jurnal {num} minimal dua baris')
+   prepared.append(Document(company_id=u.company_id,kind=kind,number=num,date=g['date'],memo=g['memo'],payload=json.dumps({'entries':g['entries']})))
+ else:
+  seen=set()
+  for idx,num,dt,v in parsed:
+   if num in existing or num in seen:raise HTTPException(400,f'Baris {idx}: nomor duplikat {num}')
+   seen.add(num);amount=dec(v[2]);cash_code=str(v[3] or '').strip();other=str(v[4] or '').strip()
+   if amount<=0:raise HTTPException(400,f'Baris {idx}: nominal harus positif')
+   account_for(s,u.company_id,cash_code,('cash','bank'));account_for(s,u.company_id,other)
+   if cash_code==other:raise HTTPException(400,f'Baris {idx}: akun kas/bank dan akun lawan sama')
+   prepared.append(Document(company_id=u.company_id,kind=kind,number=num,date=dt,memo=str(v[5] or '')[:1000],payload=json.dumps({'amount':str(amount),'cash_bank_account':cash_code,'account':other})))
+ # Apply FREE/PRO quota at posting/import time and never silently post accounting entries.
+ for d in prepared:enforce_document_limit(s,u.company_id,d.kind,d.date)
+ s.add_all(prepared);audit(s,u,'import','document',0,f'{kind}: {len(prepared)} draft');s.commit()
+ return go('/documents/'+kind+'?imported='+str(len(prepared)))
+
 @app.get('/masters/{kind}')
 def masters(req:Request,kind:str,s=Depends(db)):
  u=user(req,s);authorize(s,u,'read','masters')
  if kind not in MASTER_KINDS:raise HTTPException(404)
  if kind in ('coa','item'):ensure_system_coas(s,u.company_id);s.commit()
  items=s.query(Master).filter_by(company_id=u.company_id,kind=kind).order_by(Master.code).all()
- return page(req,s,MASTER_KINDS[kind],items=items,kind=kind,kind_label=MASTER_KINDS[kind],accounts=s.query(Master).filter_by(company_id=u.company_id,kind='coa').order_by(Master.code).all(),opening_warehouses=s.query(Master).filter_by(company_id=u.company_id,kind='warehouse').all(),units=s.query(Master).filter_by(company_id=u.company_id,kind='unit').order_by(Master.name).all(),master_summary=master_summaries(s,u.company_id,kind,items),coa_balances=coa_balance_summaries(s,u.company_id,items) if kind=='coa' else {})
+ return page(req,s,MASTER_KINDS[kind],items=items,kind=kind,kind_label=MASTER_KINDS[kind],accounts=s.query(Master).filter_by(company_id=u.company_id,kind='coa').order_by(Master.code).all(),opening_warehouses=s.query(Master).filter_by(company_id=u.company_id,kind='warehouse').all(),units=s.query(Master).filter_by(company_id=u.company_id,kind='unit').order_by(Master.name).all(),master_summary=master_summaries(s,u.company_id,kind,items),coa_balances=coa_balance_summaries(s,u.company_id,items) if kind=='coa' else {},coa_presets=COA_PRESETS if kind=='coa' else {})
 
 def coa_balance_summaries(s,cid,items):
  totals={a.id:ZERO for a in items}
@@ -865,9 +968,9 @@ def documents(req:Request,kind:str,view:str='',s=Depends(db)):
  if kind not in KINDS:raise HTTPException(404)
  if kind in ('transfer','adjust','sale_return','purchase_return') and not is_pro(s,u.company_id):raise HTTPException(403,'Menu ini hanya tersedia pada paket PRO. Buka Pengaturan → Upgrade ke PRO.')
  ensure_system_coas(s,u.company_id);s.commit()
- items=s.query(Document).filter_by(company_id=u.company_id,kind=kind).order_by(Document.id.desc()).all()
+ items=s.query(Document).filter(Document.company_id==u.company_id,Document.kind.in_(('cash_in','bank_in') if kind=='cash_in' else ('cash_out','bank_out') if kind=='cash_out' else (kind,))).order_by(Document.id.desc()).all()
  lists={k:s.query(Master).filter_by(company_id=u.company_id,kind=k).all() for k in ('customer','supplier','item','warehouse','coa','asset','salesman')}
- return page(req,s,KINDS[kind],kind=kind,items=items,lists=lists,kind_label=KINDS[kind],list_only=(view=='list'),invoice_sources=s.query(Document).filter_by(company_id=u.company_id,kind=('sale' if kind=='sale_return' else 'purchase'),status='posted').all() if kind in ('sale_return','purchase_return') else [],doc_details={d.id:json.loads(d.payload) for d in items})
+ return page(req,s,KINDS[kind],kind=kind,items=items,lists=lists,kind_label=KINDS[kind],list_only=(view=='list'),invoice_sources=s.query(Document).filter_by(company_id=u.company_id,kind=('sale' if kind=='sale_return' else 'purchase'),status='posted').all() if kind in ('sale_return','purchase_return') else [],doc_details={d.id:json.loads(d.payload) for d in items},imported_count=req.query_params.get('imported',''))
 LINE_KINDS=('sale','purchase','sale_return','purchase_return')
 async def form_payload(req,s,cid,kind):
  form=await req.form()
