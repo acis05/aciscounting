@@ -115,7 +115,7 @@ def enforce_document_limit(s,cid,kind,date_value,exclude_id=None):
 
 def admin_required(req):
  if not req.session.get('platform_admin'):raise HTTPException(403,'Login administrator diperlukan')
- if not os.getenv('ADMIN_EMAIL') or not os.getenv('ADMIN_PASSWORD_HASH'):
+ if not os.getenv('ADMIN_EMAIL') or not (os.getenv('ADMIN_PASSWORD') or os.getenv('ADMIN_PASSWORD_HASH')):
   raise HTTPException(503,'Administrator belum dikonfigurasi')
 def admin_post_origin(req):
  origin=req.headers.get('origin')
@@ -1184,10 +1184,16 @@ def platform_admin_login_page(req:Request):
  return HTMLResponse('''<!doctype html><html lang="id"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin aciscounting.id</title><style>body{font-family:system-ui;background:#eef6f1;padding:28px}form{max-width:400px;background:white;border-radius:16px;padding:26px;margin:10vh auto}input,button{box-sizing:border-box;display:block;width:100%;padding:12px;margin:10px 0}button{background:#087e50;color:white;border:0;border-radius:8px}</style><form action="/platform-admin/login" method="post"><h2>Admin Platform</h2><label>Email Admin<input type="email" name="email" required></label><label>Password Admin<input type="password" name="password" required></label><button>Masuk</button></form></html>''')
 @app.post('/platform-admin/login')
 def platform_admin_login(req:Request,email:str=Form(...),password:str=Form(...)):
- admin_email=os.getenv('ADMIN_EMAIL','').strip().lower();admin_hash=os.getenv('ADMIN_PASSWORD_HASH','')
- if not admin_email or not admin_hash:raise HTTPException(503,'Atur ADMIN_EMAIL dan ADMIN_PASSWORD_HASH di Railway')
- try:password_ok=ph.verify(admin_hash,password)
- except Exception:password_ok=False
+ admin_email=os.getenv('ADMIN_EMAIL','').strip().lower()
+ admin_password=os.getenv('ADMIN_PASSWORD','')
+ admin_hash=os.getenv('ADMIN_PASSWORD_HASH','')
+ if not admin_email or not (admin_password or admin_hash):
+  raise HTTPException(503,'Atur ADMIN_EMAIL dan ADMIN_PASSWORD di Railway')
+ if admin_password:
+  password_ok=hmac.compare_digest(password.encode('utf-8'),admin_password.encode('utf-8'))
+ else:
+  try:password_ok=ph.verify(admin_hash,password)
+  except Exception:password_ok=False
  if not (hmac.compare_digest(email.lower().strip(),admin_email) and password_ok):raise HTTPException(401,'Kredensial administrator salah')
  req.session.clear();req.session['platform_admin']=True;return go('/platform-admin')
 @app.post('/platform-admin/logout')

@@ -4,7 +4,7 @@
 - Provision PostgreSQL and connect `DATABASE_URL` (Railway PostgreSQL reference).
 - Set `SECRET_KEY` to a random 32+ byte secret and `COOKIE_SECURE=true` for HTTPS.
 - Set `ADMIN_EMAIL` to your private administrator email.
-- Generate `ADMIN_PASSWORD_HASH` using Argon2, for example: `python -c "from argon2 import PasswordHasher; import getpass; print(PasswordHasher().hash(getpass.getpass()))"`. Copy only the resulting hash into Railway Variables, never the plain password.
+- Set `ADMIN_PASSWORD` to a long, unique password in Railway Variables (mark as sealed/secret where available). Never commit this password to GitHub. `ADMIN_PASSWORD_HASH` (Argon2) is still supported as an alternative; when both exist, `ADMIN_PASSWORD` takes priority.
 - `railway.json` runs uvicorn on `$PORT`. Keep a single web replica for this SQLite-free PostgreSQL deployment until session/locking is reviewed.
 - Open `/platform-admin/login` to manage companies and users.
 - Registration `/register` defaults to FREE. Login `/login` uses email/password.
