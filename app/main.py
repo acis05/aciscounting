@@ -2,7 +2,7 @@ import os, json, io, csv, secrets, base64
 from datetime import datetime, date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from contextlib import contextmanager
-from fastapi import FastAPI, Request, Depends, Form, HTTPException
+from fastapi import FastAPI, Request, Depends, Form, HTTPException, UploadFile, File
 from fastapi.responses import RedirectResponse, StreamingResponse, Response, HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -10,7 +10,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, Numeric, Text, Boolean, UniqueConstraint, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 from argon2 import PasswordHasher
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
 from reportlab.pdfgen.canvas import Canvas
 from reportlab.lib.pagesizes import A4, A5, letter
 from reportlab.lib.utils import simpleSplit, ImageReader
@@ -331,8 +332,8 @@ def home(req:Request,s=Depends(db)):
  for j in current:
   if typ(j)=='expense':expense_totals[j.account_id]=expense_totals.get(j.account_id,ZERO)-net(j)
  top_expenses=sorted([{'name':accounts[k].name,'amount':v} for k,v in expense_totals.items() if v>0],key=lambda x:x['amount'],reverse=True)[:5]
- max_expense=max((x['amount'] for x in top_expenses),default=ZERO)
- for x in top_expenses:x['percent']=float(x['amount']/max_expense*100) if max_expense else 0
+ total_top=sum((x['amount'] for x in top_expenses),ZERO)
+ for x in top_expenses:x['percent']=round(float(x['amount']/total_top*100),2) if total_top else 0
  # Aging estimate: allocate payments/credits to oldest invoices by party and control account.
  # Do not imply exact invoice settlement without an explicit payment-to-invoice link.
  parties={x.id:x.name for x in s.query(Master).filter_by(company_id=cid).filter(Master.kind.in_(['customer','supplier']))}
@@ -358,8 +359,109 @@ def home(req:Request,s=Depends(db)):
    if due_date<=today and remaining>0:
     due[kind].append({'name':parties.get(d.party_id,'—'),'number':d.number,'date':due_date.isoformat(),'amount':remaining})
   due[kind]=sorted(due[kind],key=lambda x:x['amount'],reverse=True)[:10]
+ health,slow_stock=dashboard_insights(s,cid,today,docs,journals,accounts)
  months=[{'label':f'{m:02d}','sales':float(sum((net(j) for j in journals if typ(j) in ('income','contra_income') and j.date and j.date[:7]==f'{today.year}-{m:02d}'),ZERO))} for m in range(1,13)]
- return page(req,s,'Dashboard',sales=sales,profit=sales-expenses,receivables=receivables,payables=payables,docs=docs[:8],doc_kinds=KINDS,months=months,top_expenses=top_expenses,profit_month={'income':current_sales,'expenses':current_expenses,'profit':current_sales-current_expenses},overdue_receivables=due['sale'],overdue_payables=due['purchase'])
+ return page(req,s,'Dashboard',sales=sales,profit=sales-expenses,receivables=receivables,payables=payables,docs=docs[:8],doc_kinds=KINDS,months=months,top_expenses=top_expenses,profit_month={'income':current_sales,'expenses':current_expenses,'profit':current_sales-current_expenses},overdue_receivables=due['sale'],overdue_payables=due['purchase'],health=health,slow_stock=slow_stock)
+def dashboard_insights(s,cid,today,docs,journals,accounts):
+ # Read-only checks: never alter ledger or inventory.
+ draft_count=s.query(Document).filter_by(company_id=cid,status='draft').count()
+ balances={}
+ for j in journals:
+  balances[j.doc_id]=balances.get(j.doc_id,ZERO)+D(j.debit or 0)-D(j.credit or 0)
+ unbalanced=sum(1 for amount in balances.values() if abs(amount)>D('0.01'))
+ cash_balances={}
+ for j in journals:
+  a=accounts.get(j.account_id)
+  if a and account_type(a) in ('cash','bank'):
+   cash_balances[j.account_id]=cash_balances.get(j.account_id,ZERO)+D(j.debit or 0)-D(j.credit or 0)
+ negative_cash=[accounts[i].name for i,v in cash_balances.items() if v<0]
+ stocks=s.query(Stock).filter_by(company_id=cid).order_by(Stock.id).all()
+ qty={};last_out={};last_move={}
+ for st in stocks:
+  key=(st.item_id,st.warehouse_id)
+  qty[key]=qty.get(key,ZERO)+D(st.qty or 0)
+  if st.qty<0:last_out[st.item_id]=max(last_out.get(st.item_id,''),st.date or '')
+  last_move[st.item_id]=max(last_move.get(st.item_id,''),st.date or '')
+ negatives=sum(1 for q in qty.values() if q<0)
+ items={i.id:i for i in s.query(Master).filter_by(company_id=cid,kind='item').all()}
+ total_by_item={}
+ for (iid,wid),q in qty.items():total_by_item[iid]=total_by_item.get(iid,ZERO)+q
+ cutoff=(today-timedelta(days=90)).isoformat()
+ slow=[]
+ for iid,q in total_by_item.items():
+  if q<=0 or iid not in items:continue
+  if json.loads(items[iid].extra or '{}').get('type','goods')=='service':continue
+  last=last_out.get(iid)
+  if not last or last<cutoff:
+   slow.append({'code':items[iid].code,'name':items[iid].name,'qty':q,'last_sale':last or 'Belum pernah keluar'})
+ slow=sorted(slow,key=lambda x:(-x['qty'],x['name']))[:10]
+ health=[{'label':'Transaksi belum diposting','count':draft_count,'url':'/transactions'},
+         {'label':'Jurnal tidak seimbang','count':unbalanced,'url':'/reports/journals'},
+         {'label':'Saldo kas/bank negatif','count':len(negative_cash),'url':'/reports/cashbank'},
+         {'label':'Stok gudang negatif','count':negatives,'url':'/reports/stock'},
+         {'label':'Barang tidak terjual 90 hari','count':len(slow),'url':'/#slow-stock'}]
+ return health,slow
+
+IMPORT_KINDS={'coa':'COA','customer':'Pelanggan','supplier':'Pemasok','item':'Barang & Jasa'}
+IMPORT_HEADERS={'coa':['kode','nama','tipe_akun'], 'customer':['kode','nama'], 'supplier':['kode','nama'], 'item':['kode','nama','jenis','akun_persediaan','akun_beban','akun_hpp','akun_pendapatan']}
+COA_TYPES={'cash','bank','receivable','payable','asset','contra_asset','liability','equity','income','contra_income','expense'}
+
+def import_template_bytes(kind):
+ wb=Workbook();ws=wb.active;ws.title='Data '+kind
+ ws.append(IMPORT_HEADERS[kind]);examples={'coa':['1020','Bank BCA','bank'],'customer':['C-001','Pelanggan Contoh'],'supplier':['S-001','Pemasok Contoh'],'item':['B-001','Produk Contoh','goods','1200','','5000','4000']}
+ ws.append(examples[kind]);ws.freeze_panes='A2';ws.auto_filter.ref=f'A1:{chr(64+len(IMPORT_HEADERS[kind]))}2'
+ for cell in ws[1]:cell.font=Font(bold=True,color='FFFFFF');cell.fill=PatternFill('solid',fgColor='176A47');cell.alignment=Alignment(wrap_text=True)
+ for col in ws.columns:ws.column_dimensions[col[0].column_letter].width=max(18,min(32,max(len(str(c.value or '')) for c in col)+4))
+ info=wb.create_sheet('Petunjuk');info.append(['Petunjuk impor master']);info.append(['Hapus baris contoh sebelum impor data nyata.']);info.append(['Kode wajib unik per perusahaan dan jenis master.']);info.append(['Baris kosong diabaikan; jika ada kesalahan, tidak ada data yang disimpan.']);info.append(['Jenis barang: goods atau service. Tipe akun mengikuti pilihan COA.']);info.append(['Kolom akun barang/jasa opsional, gunakan kode COA yang sudah terdaftar.']);info.column_dimensions['A'].width=105
+ out=io.BytesIO();wb.save(out);return out.getvalue()
+
+@app.get('/masters/{kind}/template.xlsx')
+def master_import_template(req:Request,kind:str,s=Depends(db)):
+ u=user(req,s);authorize(s,u,'read','masters')
+ if kind not in IMPORT_KINDS:raise HTTPException(404)
+ return Response(import_template_bytes(kind),media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':f'attachment; filename="template_{kind}.xlsx"'})
+
+@app.post('/masters/{kind}/import')
+async def master_import(req:Request,kind:str,file:UploadFile=File(...),s=Depends(db)):
+ u=user(req,s);authorize(s,u,'write','masters')
+ if kind not in IMPORT_KINDS:raise HTTPException(404)
+ raw=await file.read(2_000_001)
+ if len(raw)>2_000_000:raise HTTPException(400,'Ukuran Excel maksimal 2 MB')
+ try:wb=load_workbook(io.BytesIO(raw),read_only=True,data_only=True)
+ except Exception:raise HTTPException(400,'File harus berupa Excel .xlsx yang valid')
+ ws=wb.worksheets[0];headers=[str(c.value or '').strip().lower() for c in next(ws.iter_rows(max_row=1))]
+ if headers!=IMPORT_HEADERS[kind]:raise HTTPException(400,'Header Excel tidak cocok dengan template '+kind)
+ existing={x.code for x in s.query(Master).filter_by(company_id=u.company_id,kind=kind)}
+ coa_lookup={x.code:x for x in s.query(Master).filter_by(company_id=u.company_id,kind='coa')}
+ prepared=[];seen=set();errors=[]
+ for index,row in enumerate(ws.iter_rows(min_row=2,values_only=True),start=2):
+  if not any(v is not None and str(v).strip() for v in row):continue
+  if index>1001:errors.append('Maksimal 1000 baris data');break
+  vals=[str(v).strip() if v is not None else '' for v in row[:len(headers)]]
+  vals+=['']*(len(headers)-len(vals));code,name=vals[:2]
+  if not code or not name or len(code)>60 or len(name)>180:errors.append(f'Baris {index}: kode/nama kosong atau terlalu panjang');continue
+  if code in existing or code in seen:errors.append(f'Baris {index}: kode {code} sudah ada/duplikat');continue
+  seen.add(code);extra={}
+  if kind=='coa':
+   typ=vals[2].lower()
+   if typ not in COA_TYPES:errors.append(f'Baris {index}: tipe akun tidak valid');continue
+   extra={'type':typ}
+  elif kind=='item':
+   typ=(vals[2] or 'goods').lower()
+   if typ not in ('goods','service'):errors.append(f'Baris {index}: jenis harus goods/service');continue
+   extra={'type':typ}
+   for key,val,allowed in zip(['inventory_account','expense_account','cogs_account','income_account'],vals[3:7],[('asset',),('expense',),('expense',),('income',)]):
+    if not val:continue
+    account=coa_lookup.get(val)
+    if not account or account_type(account) not in allowed:errors.append(f'Baris {index}: akun {key} ({val}) tidak sesuai COA');continue
+    extra[key]=val
+  prepared.append(Master(company_id=u.company_id,kind=kind,code=code,name=name,extra=json.dumps(extra)))
+ wb.close()
+ if errors:raise HTTPException(400,'Impor dibatalkan, tidak ada data tersimpan. '+ '; '.join(errors[:12]))
+ if not prepared:raise HTTPException(400,'Tidak ada baris data untuk diimpor')
+ s.add_all(prepared);audit(s,u,'import',kind,0,f'{len(prepared)} master dari Excel');s.commit()
+ return go('/masters/'+kind+'?imported='+str(len(prepared)))
+
 @app.get('/register')
 def regpage(req:Request,s=Depends(db)):return page(req,s,'Daftar')
 @app.post('/register')
