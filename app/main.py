@@ -477,6 +477,7 @@ def import_template_bytes(kind):
 def master_import_template(req:Request,kind:str,s=Depends(db)):
  u=user(req,s);authorize(s,u,'read','masters')
  if kind not in IMPORT_KINDS:raise HTTPException(404)
+ if not is_pro(s,u.company_id):raise HTTPException(403,'Template dan impor Excel hanya tersedia di PRO')
  return Response(import_template_bytes(kind),media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':f'attachment; filename="template_{kind}.xlsx"'})
 
 @app.post('/masters/{kind}/import')
@@ -698,7 +699,7 @@ async def master_edit(req:Request,kind:str,mid:int,code:str=Form(...),name:str=F
    data['type']=SYSTEM_CODES[system][1]
  x.code=code.strip()[:60];x.name=name.strip()[:180];x.extra=json.dumps(data)
  f=await req.form()
- if kind in ('coa','customer','supplier','item') and 'opening_balance' in f:
+ if kind in ('coa','customer','supplier','item') and ('opening_balance' in f or (kind=='item' and 'opening_qty' in f)):
   opening_balance(s,u,x,dec(f.get('opening_balance') or 0),dec(f.get('opening_qty') or 0),dec(f.get('opening_unit_cost') or 0),int(f.get('opening_warehouse') or 0))
  audit(s,u,'edit',kind,x.id,x.code);s.commit();return go('/masters/'+kind)
 @app.post('/masters/{kind}/{mid}/delete')
@@ -726,6 +727,11 @@ def subledger(req:Request,account_id:int=0,party_id:int=0,s=Depends(db)):
  docs={x.id:x.number for x in s.query(Document).filter_by(company_id=u.company_id).all()}
  names={x.id:x.name for x in parties}
  return page(req,s,'Buku Besar Pembantu',subledger_accounts=accounts,subledger_parties=parties,subledger_rows=rows,subledger_names=names,subledger_docs=docs,selected_account=account_id,selected_party=party_id)
+@app.get('/settings/upgrade')
+def upgrade_page(req:Request,s=Depends(db)):
+ u=user(req,s)
+ return page(req,s,'Upgrade ke PRO',upgrade_info=True)
+
 @app.get('/settings/cutoff')
 def cutoff_settings(req:Request,s=Depends(db)):
  u=user(req,s);authorize(s,u,'manage','settings')
@@ -841,6 +847,7 @@ def transactions_overview(req:Request,s=Depends(db)):
 def documents(req:Request,kind:str,view:str='',s=Depends(db)):
  u=user(req,s);authorize(s,u,'read','documents')
  if kind not in KINDS:raise HTTPException(404)
+ if kind in ('transfer','adjust','sale_return','purchase_return') and not is_pro(s,u.company_id):raise HTTPException(403,'Menu ini hanya tersedia pada paket PRO. Buka Pengaturan → Upgrade ke PRO.')
  ensure_system_coas(s,u.company_id);s.commit()
  items=s.query(Document).filter_by(company_id=u.company_id,kind=kind).order_by(Document.id.desc()).all()
  lists={k:s.query(Master).filter_by(company_id=u.company_id,kind=k).all() for k in ('customer','supplier','item','warehouse','coa','asset','salesman')}
@@ -925,7 +932,9 @@ def unlock_posted_document(s,u,x):
 
 @app.post('/documents/{kind}/{did}/reopen')
 def document_reopen(req:Request,kind:str,did:int,s=Depends(db)):
- u=user(req,s);authorize(s,u,'write','documents');x=owned(s,Document,did,u.company_id)
+ u=user(req,s);authorize(s,u,'write','documents')
+ if kind in ('transfer','adjust','sale_return','purchase_return') and not is_pro(s,u.company_id):raise HTTPException(403,'Fitur ini hanya tersedia di PRO')
+ x=owned(s,Document,did,u.company_id)
  if x.kind!=kind:raise HTTPException(404)
  if x.status=='posted':
   try:
@@ -937,7 +946,9 @@ def document_reopen(req:Request,kind:str,did:int,s=Depends(db)):
 
 @app.post('/documents/{kind}/{did}/edit')
 async def document_edit(req:Request,kind:str,did:int,number:str=Form(...),date_value:str=Form(...,alias='date'),party_id:int=Form(0),warehouse_id:int=Form(0),memo:str=Form(''),payload:str=Form('{}'),s=Depends(db)):
- u=user(req,s);authorize(s,u,'write','documents');x=owned(s,Document,did,u.company_id)
+ u=user(req,s);authorize(s,u,'write','documents')
+ if kind in ('transfer','adjust','sale_return','purchase_return') and not is_pro(s,u.company_id):raise HTTPException(403,'Fitur ini hanya tersedia di PRO')
+ x=owned(s,Document,did,u.company_id)
  if x.kind!=kind or x.status!='draft':raise HTTPException(400,'Klik Edit pada transaksi terposting untuk membuka kembali sebagai Draft terlebih dahulu')
  try:date.fromisoformat(date_value)
  except:raise HTTPException(400,'Tanggal tidak valid')
@@ -948,7 +959,9 @@ async def document_edit(req:Request,kind:str,did:int,number:str=Form(...),date_v
  x.number=number.strip()[:60];x.date=date_value;x.party_id=party_id or None;x.warehouse_id=warehouse_id or None;x.memo=memo[:1000];x.payload=json.dumps(p);audit(s,u,'edit','document',x.id,x.number);s.commit();return go('/documents/'+kind)
 @app.post('/documents/{kind}/{did}/delete')
 def document_delete(req:Request,kind:str,did:int,s=Depends(db)):
- u=user(req,s);authorize(s,u,'write','documents');x=owned(s,Document,did,u.company_id)
+ u=user(req,s);authorize(s,u,'write','documents')
+ if kind in ('transfer','adjust','sale_return','purchase_return') and not is_pro(s,u.company_id):raise HTTPException(403,'Fitur ini hanya tersedia di PRO')
+ x=owned(s,Document,did,u.company_id)
  if x.kind!=kind:raise HTTPException(404)
  try:
   if x.status=='posted':unlock_posted_document(s,u,x)
@@ -1037,6 +1050,8 @@ def print_sale(req:Request,did:int,print_type:str,s=Depends(db)):
 @app.get('/reports/{name}')
 def report(req:Request,name:str,format:str='html',start:str='',end:str='',account_id:int=0,s=Depends(db)):
  u=user(req,s);authorize(s,u,'read','reports');cid=u.company_id
+ if format not in ('html','xlsx','pdf'):raise HTTPException(400,'Format laporan tidak valid')
+ if format in ('xlsx','pdf') and not is_pro(s,cid):raise HTTPException(403,'Ekspor Excel dan PDF hanya tersedia pada paket PRO')
  if name=='cashflow' and not is_pro(s,cid):raise HTTPException(403,'Laporan Arus Kas tersedia pada paket PRO')
  if name in ('assets',):raise HTTPException(404,'Modul aset tetap tidak tersedia')
  if name=='bank':

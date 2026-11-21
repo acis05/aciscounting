@@ -25,3 +25,15 @@
 - Beta. Verify tenant isolation, CSRF protection for all forms, login rate limiting, email verification, payment verification, database migration, backups and accounting reconciliation before opening paid subscriptions.
 - Admin password hash and session secret must never be committed to GitHub.
 - Reset sessions remain valid until a user next requests a page; enforce full session invalidation in a production hardening pass.
+
+## Perubahan v1.7 — paket FREE/PRO
+
+- FREE: impor master Excel (termasuk template) diblokir server; PRO tetap dapat mengimpor.
+- FREE: hanya satu gudang bawaan; form tambah gudang disembunyikan dan endpoint tambah gudang dibatasi di server.
+- FREE: transfer gudang, penyesuaian barang, retur penjualan dan retur pembelian ditandai (PRO), diarahkan ke halaman Upgrade dan diblokir di endpoint akses dokumen.
+- FREE: seluruh ekspor laporan Excel/PDF diblokir di server dan tombol ekspor disembunyikan; tampilan HTML tetap tersedia kecuali Arus Kas.
+- Barang: nilai saldo awal otomatis dari Qty Awal × Harga Pokok Awal per unit, tanpa input Saldo Awal (Rp) tersendiri. Nilai jurnal pembukaan dihitung backend.
+- Pengaturan → Upgrade ke PRO berisi manfaat PRO, Rp299.000/tahun dan tautan WhatsApp 0878-8453-8950.
+- Upgrade PRO masih manual melalui panel admin; tidak ada pembayaran otomatis atau konfirmasi pembayaran di aplikasi.
+
+Lakukan backup database dan uji pada Railway staging sebelum deploy publik.
