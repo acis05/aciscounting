@@ -106,3 +106,13 @@ Registrasi, halaman master, form transaksi, posting pembelian + PPN, posting pen
 - Master COA, pelanggan, pemasok, barang & jasa: template Excel dan impor .xlsx (maksimal 1000 baris, 2 MB). Seluruh baris divalidasi sebelum commit. Baris contoh template harus dihapus.
 - Periksa role pengguna: unduh template memerlukan izin baca master, impor memerlukan izin tulis master.
 - Batasan: pemeriksaan kesehatan bukan audit formal; laporan dan persediaan tetap perlu rekonsiliasi sebelum produksi.
+
+
+## Pembaruan v1.3 Beta
+- Hilangkan catatan estimasi jatuh tempo dari dashboard (algoritme estimasi belum berubah).
+- Grafik pendapatan bersih bulanan tahun berjalan dan kas/bank masuk-keluar 7 hari dari transaksi terposting.
+- Daftar master ringkas dengan halaman Detail/Edit terpisah.
+- Pelanggan/pemasok: telepon dan saldo dari jurnal pembantu; saldo tidak tersedia untuk jurnal tanpa relasi pihak.
+- Barang/jasa: total kuantitas stok semua gudang, harga jual default pada faktur penjualan, satuan kustom melalui Master Data > Satuan.
+- Impor Excel barang/jasa kini punya kolom harga_jual dan satuan; gunakan template baru.
+- Versi beta: uji di database staging dan backup PostgreSQL sebelum deploy.
