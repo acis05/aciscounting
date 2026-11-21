@@ -102,7 +102,7 @@ def page(req,s,title,**ctx):
  except HTTPException:u=None
  c=s.get(Company,u.company_id) if u else None
  return tpl.TemplateResponse('app.html',{'request':req,'title':title,'user':u,'company':c,'cash':cash,'today':date.today().isoformat(),**ctx})
-ACCOUNTS=[('1000','Kas','cash'),('1010','Bank','bank'),('1100','Piutang Usaha','receivable'),('1200','Persediaan','asset'),('1500','Aset Tetap','asset'),('1590','Akumulasi Penyusutan','contra_asset'),('2000','Hutang Usaha','payable'),('3000','Modal','equity'),('4000','Penjualan','income'),('4010','Retur Penjualan','contra_income'),('5000','HPP','expense'),('6000','Beban Operasional','expense'),('6100','Beban Penyusutan','expense'),('1201','Selisih Persediaan','expense'),('1150','PPN Masukan','asset'),('2100','PPN Keluaran','liability')]
+ACCOUNTS=[('1000','Kas','cash'),('1010','Bank','bank'),('1100','Piutang Usaha','receivable'),('1200','Persediaan','asset'),('1500','Aset Tetap','asset'),('1590','Akumulasi Penyusutan','contra_asset'),('2000','Hutang Usaha','payable'),('3000','Modal','equity'),('4000','Penjualan','income'),('4010','Retur Penjualan','contra_income'),('5000','HPP','cogs'),('6000','Beban Operasional','expense'),('6100','Beban Penyusutan','expense'),('1201','Selisih Persediaan','expense'),('1150','PPN Masukan','asset'),('2100','PPN Keluaran','liability')]
 def seed(s,cid):
  for code,name,typ in ACCOUNTS:s.add(Master(company_id=cid,kind='coa',code=code,name=name,extra=json.dumps({'type':typ,'system_code':code})))
  s.add(Master(company_id=cid,kind='warehouse',code='GD-01',name='Gudang Utama'))
@@ -120,7 +120,7 @@ def ensure_system_coas(s,cid):
  existing=s.query(Master).filter_by(company_id=cid,kind='coa').all()
  for x in existing:
   code=system_code(x)
-  if code in ('1000','1010','1100','2000'):
+  if code in ('1000','1010','1100','2000','5000'):
    data=json.loads(x.extra or '{}');data['type']=SYSTEM_CODES[code][1];data['system_code']=code;x.extra=json.dumps(data)
  aliases={system_code(x) for x in existing}
  for code,(name,typ) in SYSTEM_CODES.items():
@@ -309,7 +309,7 @@ def post(s,doc):
  lines(s,doc,E);doc.status='posted'
 
 KINDS={'cash_in':'Kas Masuk','cash_out':'Kas Keluar','bank_in':'Bank Masuk','bank_out':'Bank Keluar','sale':'Faktur Penjualan','sale_receipt':'Penerimaan Penjualan','sale_return':'Retur Penjualan','purchase':'Faktur Pembelian','purchase_payment':'Pembayaran Pembelian','purchase_return':'Retur Pembelian','transfer':'Transfer Gudang','adjust':'Penyesuaian Persediaan','journal':'Jurnal Umum','depreciation':'Penyusutan'}
-MASTER_KINDS={'coa':'COA','customer':'Pelanggan','supplier':'Pemasok','item':'Barang / Jasa','warehouse':'Gudang','asset':'Aset Tetap','unit':'Satuan'}
+MASTER_KINDS={'coa':'COA','customer':'Pelanggan','supplier':'Pemasok','item':'Barang / Jasa','warehouse':'Gudang','asset':'Aset Tetap','unit':'Satuan','salesman':'Salesman'}
 @app.get('/')
 def home(req:Request,s=Depends(db)):
  try:u=user(req,s)
@@ -322,12 +322,12 @@ def home(req:Request,s=Depends(db)):
  def typ(j):return account_type(accounts[j.account_id]) if j.account_id in accounts else ''
  def net(j):return D(j.credit or 0)-D(j.debit or 0)
  sales=sum((net(j) for j in journals if typ(j) in ('income','contra_income')),ZERO)
- expenses=sum((-net(j) for j in journals if typ(j)=='expense'),ZERO)
+ expenses=sum((-net(j) for j in journals if typ(j) in ('expense','cogs')),ZERO)
  receivables=sum((-net(j) for j in journals if typ(j)=='receivable'),ZERO)
  payables=sum((net(j) for j in journals if typ(j)=='payable'),ZERO)
  current=[j for j in journals if j.date and j.date.startswith(month)]
  current_sales=sum((net(j) for j in current if typ(j) in ('income','contra_income')),ZERO)
- current_expenses=sum((-net(j) for j in current if typ(j)=='expense'),ZERO)
+ current_expenses=sum((-net(j) for j in current if typ(j) in ('expense','cogs')),ZERO)
  expense_totals={}
  for j in current:
   if typ(j)=='expense':expense_totals[j.account_id]=expense_totals.get(j.account_id,ZERO)-net(j)
@@ -410,7 +410,7 @@ def dashboard_insights(s,cid,today,docs,journals,accounts):
 
 IMPORT_KINDS={'coa':'COA','customer':'Pelanggan','supplier':'Pemasok','item':'Barang & Jasa'}
 IMPORT_HEADERS={'coa':['kode','nama','tipe_akun'], 'customer':['kode','nama','telepon'], 'supplier':['kode','nama','telepon'], 'item':['kode','nama','jenis','akun_persediaan','akun_beban','akun_hpp','akun_pendapatan','harga_jual','satuan']}
-COA_TYPES={'cash','bank','receivable','payable','asset','contra_asset','liability','equity','income','contra_income','expense'}
+COA_TYPES={'cash','bank','receivable','payable','asset','contra_asset','liability','equity','income','contra_income','cogs','expense'}
 
 def import_template_bytes(kind):
  wb=Workbook();ws=wb.active;ws.title='Data '+kind
@@ -463,7 +463,7 @@ async def master_import(req:Request,kind:str,file:UploadFile=File(...),s=Depends
    except Exception:errors.append(f'Baris {index}: harga jual tidak valid');continue
    extra['unit']=vals[8] if len(vals)>8 else ''
    if extra['unit'] and not s.query(Master).filter_by(company_id=u.company_id,kind='unit',code=extra['unit']).first():errors.append(f'Baris {index}: satuan {extra["unit"]} belum terdaftar');continue
-   for key,val,allowed in zip(['inventory_account','expense_account','cogs_account','income_account'],vals[3:7],[('asset',),('expense',),('expense',),('income',)]):
+   for key,val,allowed in zip(['inventory_account','expense_account','cogs_account','income_account'],vals[3:7],[('asset',),('expense',),('cogs',),('income',)]):
     if not val:continue
     account=coa_lookup.get(val)
     if not account or account_type(account) not in allowed:errors.append(f'Baris {index}: akun {key} ({val}) tidak sesuai COA');continue
@@ -524,15 +524,15 @@ async def master_extra(req,kind):
  f=await req.form()
  if kind=='coa':
   typ=f.get('account_type') or 'asset'
-  if typ not in ('cash','bank','receivable','payable','asset','contra_asset','liability','equity','income','contra_income','expense'):raise HTTPException(400,'Tipe akun tidak valid')
+  if typ not in ('cash','bank','receivable','payable','asset','contra_asset','liability','equity','income','contra_income','cogs','expense'):raise HTTPException(400,'Tipe akun tidak valid')
   return {'type':typ}
  if kind in ('customer','supplier'):
-  return {'phone':(f.get('phone') or '').strip()[:50]}
+  return {'phone':(f.get('phone') or '').strip()[:50], 'address':(f.get('address') or '').strip()[:500], 'contact_name':(f.get('contact_name') or '').strip()[:180], 'email':(f.get('email') or '').strip()[:180]}
  if kind=='item':
   typ=f.get('item_type') or 'goods'
   if typ not in ('goods','service'):raise HTTPException(400,'Jenis barang tidak valid')
   data={'type':typ}
-  allowed={'inventory_account':('asset',),'cogs_account':('expense',),'income_account':('income',),'expense_account':('expense',)}
+  allowed={'inventory_account':('asset',),'cogs_account':('cogs',),'income_account':('income',),'expense_account':('expense',)}
   for key,types in allowed.items():
    code=(f.get(key) or '').strip()
    if code:account_for(req.state.db,req.state.company_id,code,types);data[key]=code
@@ -698,7 +698,7 @@ def documents(req:Request,kind:str,view:str='',s=Depends(db)):
  if kind not in KINDS:raise HTTPException(404)
  ensure_system_coas(s,u.company_id);s.commit()
  items=s.query(Document).filter_by(company_id=u.company_id,kind=kind).order_by(Document.id.desc()).all()
- lists={k:s.query(Master).filter_by(company_id=u.company_id,kind=k).all() for k in ('customer','supplier','item','warehouse','coa','asset')}
+ lists={k:s.query(Master).filter_by(company_id=u.company_id,kind=k).all() for k in ('customer','supplier','item','warehouse','coa','asset','salesman')}
  return page(req,s,KINDS[kind],kind=kind,items=items,lists=lists,kind_label=KINDS[kind],list_only=(view=='list'),invoice_sources=s.query(Document).filter_by(company_id=u.company_id,kind=('sale' if kind=='sale_return' else 'purchase'),status='posted').all() if kind in ('sale_return','purchase_return') else [],doc_details={d.id:json.loads(d.payload) for d in items})
 LINE_KINDS=('sale','purchase','sale_return','purchase_return')
 async def form_payload(req,s,cid,kind):
@@ -712,7 +712,8 @@ async def form_payload(req,s,cid,kind):
    master(s,cid,'item',int(iid))
    rows.append({'item_id':int(iid),'qty':str(qty),'price':str(price),'tax_rate':str(rate),'discount':str(discount)})
   if not rows:raise HTTPException(400,'Tambahkan minimal satu barang/jasa')
-  p={'items':rows,'control_account':(form.get('control_account') or ('1100' if kind.startswith('sale') else '2000')),'invoice_discount':str(form.get('invoice_discount') or '0'),'due_date':str(form.get('due_date') or '')}
+  p={'items':rows,'control_account':(form.get('control_account') or ('1100' if kind.startswith('sale') else '2000')),'invoice_discount':str(form.get('invoice_discount') or '0'),'due_date':str(form.get('due_date') or ''),'salesman_id':int(form.get('salesman_id') or 0) if kind=='sale' else 0}
+  if kind=='sale' and p['salesman_id']:master(s,cid,'salesman',p['salesman_id'])
   if kind.endswith('return'):p['source_id']=int(form.get('source_id') or 0)
   return p
  if kind=='journal':

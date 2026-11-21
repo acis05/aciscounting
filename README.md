@@ -116,3 +116,10 @@ Registrasi, halaman master, form transaksi, posting pembelian + PPN, posting pen
 - Barang/jasa: total kuantitas stok semua gudang, harga jual default pada faktur penjualan, satuan kustom melalui Master Data > Satuan.
 - Impor Excel barang/jasa kini punya kolom harga_jual dan satuan; gunakan template baru.
 - Versi beta: uji di database staging dan backup PostgreSQL sebelum deploy.
+
+
+## v1.4 Beta
+- COA tipe HPP terpisah dari Beban; akun sistem 5000 dimigrasikan menjadi tipe HPP secara idempoten. Grafik 5 beban tertinggi hanya menampilkan tipe Beban; laba rugi tetap mengurangi HPP dan beban.
+- Detail Pelanggan dan Pemasok memiliki Alamat, Nama Kontak, Email.
+- Master Salesman (kode/nama) dan pilihan Salesman pada faktur penjualan (draft, edit, posting).
+- Sebelum deploy, backup database dan uji di staging.

@@ -52,19 +52,19 @@ def report_model(name,accounts,journals,documents,start,end,account_id=None):
   costs=Z;expenses=Z
   add('Beban Pokok Penjualan',kind='section')
   for a in sorted(accounts,key=lambda x:x.code):
-   if account_type(a)=='expense' and (a.code.startswith('5') or a.code=='1201'):
+   if account_type(a)=='cogs':
     v=balance(a,t);costs+=v
     if v:add(a.name,v,1,'detail',a.code)
   add('Jumlah Beban Pokok Penjualan',costs,kind='subtotal')
   gross=net-costs;add('LABA (RUGI) KOTOR',gross,kind='total')
   add('Beban Operasional dan Lainnya',kind='section')
   for a in sorted(accounts,key=lambda x:x.code):
-   if account_type(a)=='expense' and not (a.code.startswith('5') or a.code=='1201'):
+   if account_type(a)=='expense':
     v=balance(a,t);expenses+=v
     if v:add(a.name,v,1,'detail',a.code)
   add('Jumlah Beban Operasional dan Lainnya',expenses,kind='subtotal')
   add('LABA (RUGI) PERIODE BERJALAN',gross-expenses,kind='grand')
-  notes.append('Klasifikasi HPP memakai kode akun 5xxx dan 1201; periksa pemetaan COA jika kode akun diubah.')
+  notes.append('HPP dikelompokkan berdasarkan tipe akun HPP, bukan awalan kode akun.')
  elif name=='balance':
   assets=group('ASET',('asset','contra_asset','cash','bank','receivable'),'debit',all_t)
   liabilities=group('LIABILITAS',('liability','payable'),'credit',all_t)
@@ -74,7 +74,7 @@ def report_model(name,accounts,journals,documents,start,end,account_id=None):
    typ=account_type(a)
    if typ=='income':profit+=balance(a,all_t,'credit')
    elif typ=='contra_income':profit-=balance(a,all_t,'debit')
-   elif typ=='expense':profit-=balance(a,all_t,'debit')
+   elif typ in ('expense','cogs'):profit-=balance(a,all_t,'debit')
   add('Laba (Rugi) Akumulatif Belum Ditutup',profit,1)
   add('JUMLAH LIABILITAS DAN EKUITAS',liabilities+equity+profit,kind='grand')
   add('SELISIH KESEIMBANGAN',assets-liabilities-equity-profit,kind='check')
