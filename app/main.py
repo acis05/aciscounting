@@ -1,5 +1,5 @@
 import os, json, io, csv, secrets, base64
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from contextlib import contextmanager
 from fastapi import FastAPI, Request, Depends, Form, HTTPException
@@ -55,7 +55,7 @@ from sqlalchemy import inspect, text as sqltext
 with engine.begin() as connection:
  if 'print_templates' in inspect(connection).get_table_names() and 'settings' not in {c['name'] for c in inspect(connection).get_columns('print_templates')}:
   connection.execute(sqltext("ALTER TABLE print_templates ADD COLUMN settings TEXT DEFAULT '{}'"))
-app=FastAPI(title='aciscounting.id',version='0.9.0')
+app=FastAPI(title='aciscounting.id',version='1.1.0')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SECRET_KEY','DEV_ONLY_CHANGE_THIS_SECRET'),https_only=os.getenv('COOKIE_SECURE','false').lower()=='true',same_site='lax')
 ROOT=os.path.dirname(__file__);tplfilter=lambda v: json.loads(v or '{}');app.mount('/static',StaticFiles(directory=ROOT+'/static'),name='static');tpl=Jinja2Templates(directory=ROOT+'/templates');tpl.env.filters['from_json']=tplfilter
 @app.exception_handler(HTTPException)
@@ -203,14 +203,22 @@ def post(s,doc):
    if doc.party_id!=original.party_id:raise HTTPException(400,'Pelanggan/pemasok harus sama dengan faktur asal')
    if doc.date<original.date:raise HTTPException(400,'Tanggal retur tidak boleh sebelum faktur')
    source_lines={str(z.get('item_id')):z for z in json.loads(original.payload).get('items',[])}
-  for line in items:
+  invoice_discount=dec(p.get('invoice_discount',0)) if k in ('sale','purchase') else ZERO
+  eligible=sum((dec(D(str(z.get('qty') or 0))*dec(z.get('price',0)))-dec(z.get('discount',0)) for z in items),ZERO)
+  if invoice_discount<0 or invoice_discount>eligible:raise HTTPException(400,'Diskon faktur melebihi nilai bersih barang/jasa')
+  remaining_discount=invoice_discount
+  for line_index,line in enumerate(items):
    iid=int(line.get('item_id') or 0);x=master(s,doc.company_id,'item',iid)
    quantity=D(str(line.get('qty') or 0));price=dec(line.get('price'));rate=dec(line.get('tax_rate',0))
    if quantity<=0 or price<0 or rate not in (ZERO,D('11.00'),D('12.00')):raise HTTPException(400,'Qty, harga, atau tarif PPN tidak valid')
    # Use 0%, 11%, 12% as configurable nominal rate; tax regulations can require different effective bases.
    gross=dec(quantity*price);discount=dec(line.get('discount',0));base=gross-discount
    if discount<0 or discount>gross:raise HTTPException(400,'Diskon tidak boleh negatif atau melebihi subtotal')
-   vat=dec(base*rate/D(100));subtotal+=base;tax+=vat
+   if invoice_discount and eligible:
+    allocated=remaining_discount if line_index==len(items)-1 else min(remaining_discount,dec(invoice_discount*base/eligible))
+    if allocated>base:raise HTTPException(400,'Diskon faktur tidak valid')
+    base-=allocated;remaining_discount-=allocated
+    line['posted_invoice_discount']=str(allocated)
    item_type,accounts=item_accounts(s,doc.company_id,x)
    if item_type not in ('goods','service'):raise HTTPException(400,'Tipe barang/jasa tidak valid')
    if original:
@@ -225,6 +233,10 @@ def post(s,doc):
     if quantity+returned>D(str(sl.get('qty') or 0)):raise HTTPException(400,'Jumlah retur melebihi faktur asal')
     expected_discount=dec(dec(sl.get('discount',0))*quantity/D(str(sl.get('qty'))))
     if price!=dec(sl.get('price')) or rate!=dec(sl.get('tax_rate',0)) or discount!=expected_discount:raise HTTPException(400,'Harga dan PPN retur harus sama dengan faktur asal')
+    return_invoice_discount=dec(dec(sl.get('posted_invoice_discount',0))*quantity/D(str(sl.get('qty'))))
+    base-=return_invoice_discount
+    line['posted_invoice_discount']=str(return_invoice_discount)
+   vat=dec(base*rate/D(100));subtotal+=base;tax+=vat
    if k in ('sale','sale_return'):
     code=accounts['income_account'];income_lines[code]=income_lines.get(code,ZERO)+base
    elif item_type=='service':
@@ -301,10 +313,53 @@ MASTER_KINDS={'coa':'COA','customer':'Pelanggan','supplier':'Pemasok','item':'Ba
 def home(req:Request,s=Depends(db)):
  try:u=user(req,s)
  except HTTPException:return go('/login')
- cid=u.company_id;docs=s.query(Document).filter_by(company_id=cid,status='posted').all();j=s.query(Journal).filter_by(company_id=cid).all();am={x.id:system_code(x) for x in s.query(Master).filter_by(company_id=cid,kind='coa')}
- def sumcode(code,side):return sum((D(getattr(x,side) or 0) for x in j if am.get(x.account_id)==code),ZERO)
- sales=sumcode('4000','credit')-sumcode('4010','debit');expenses=sum((D(x.debit or 0)-D(x.credit or 0) for x in j if am.get(x.account_id) in ('5000','6000','6100','1201')),ZERO)
- return page(req,s,'Dashboard',sales=sales,profit=sales-expenses,receivables=sumcode('1100','debit')-sumcode('1100','credit'),payables=sumcode('2000','credit')-sumcode('2000','debit'),docs=docs[-8:],doc_kinds=KINDS,months=[{'label':f'{m:02d}','sales':float(sum((D(x.credit or 0) for x in j if am.get(x.account_id)=='4000' and x.date[5:7]==f'{m:02d}'),ZERO))} for m in range(1,13)])
+ authorize(s,u,'read','reports')
+ cid=u.company_id;today=date.today();month=today.strftime('%Y-%m')
+ docs=s.query(Document).filter_by(company_id=cid,status='posted').order_by(Document.date.desc(),Document.id.desc()).all()
+ accounts={x.id:x for x in s.query(Master).filter_by(company_id=cid,kind='coa')}
+ journals=s.query(Journal).filter_by(company_id=cid).all()
+ def typ(j):return account_type(accounts[j.account_id]) if j.account_id in accounts else ''
+ def net(j):return D(j.credit or 0)-D(j.debit or 0)
+ sales=sum((net(j) for j in journals if typ(j) in ('income','contra_income')),ZERO)
+ expenses=sum((-net(j) for j in journals if typ(j)=='expense'),ZERO)
+ receivables=sum((-net(j) for j in journals if typ(j)=='receivable'),ZERO)
+ payables=sum((net(j) for j in journals if typ(j)=='payable'),ZERO)
+ current=[j for j in journals if j.date and j.date.startswith(month)]
+ current_sales=sum((net(j) for j in current if typ(j) in ('income','contra_income')),ZERO)
+ current_expenses=sum((-net(j) for j in current if typ(j)=='expense'),ZERO)
+ expense_totals={}
+ for j in current:
+  if typ(j)=='expense':expense_totals[j.account_id]=expense_totals.get(j.account_id,ZERO)-net(j)
+ top_expenses=sorted([{'name':accounts[k].name,'amount':v} for k,v in expense_totals.items() if v>0],key=lambda x:x['amount'],reverse=True)[:5]
+ max_expense=max((x['amount'] for x in top_expenses),default=ZERO)
+ for x in top_expenses:x['percent']=float(x['amount']/max_expense*100) if max_expense else 0
+ # Aging estimate: allocate payments/credits to oldest invoices by party and control account.
+ # Do not imply exact invoice settlement without an explicit payment-to-invoice link.
+ parties={x.id:x.name for x in s.query(Master).filter_by(company_id=cid).filter(Master.kind.in_(['customer','supplier']))}
+ due={'sale':[],'purchase':[]}
+ for kind,control_type in (('sale','receivable'),('purchase','payable')):
+  invoices=[d for d in docs if d.kind==kind and d.party_id]
+  credits={}
+  for j in journals:
+   if typ(j)!=control_type:continue
+   doc=s.get(Document,j.doc_id)
+   if not doc or not doc.party_id or doc.kind==kind:continue
+   key=(doc.party_id,j.account_id)
+   change=net(j) if control_type=='receivable' else -net(j)
+   credits[key]=credits.get(key,ZERO)+change
+  for d in sorted(invoices,key=lambda d:(d.date,d.id)):
+   payload=json.loads(d.payload or '{}');control=payload.get('control_account') or ('1100' if kind=='sale' else '2000')
+   try:account_id=coa(s,cid,control)
+   except HTTPException:continue
+   key=(d.party_id,account_id);gross=dec(payload.get('amount',0));available=max(ZERO,credits.get(key,ZERO));used=min(gross,available)
+   credits[key]=available-used;remaining=gross-used
+   try:due_date=date.fromisoformat(payload.get('due_date') or '')
+   except ValueError:due_date=date.fromisoformat(d.date)+timedelta(days=30)
+   if due_date<=today and remaining>0:
+    due[kind].append({'name':parties.get(d.party_id,'—'),'number':d.number,'date':due_date.isoformat(),'amount':remaining})
+  due[kind]=sorted(due[kind],key=lambda x:x['amount'],reverse=True)[:10]
+ months=[{'label':f'{m:02d}','sales':float(sum((net(j) for j in journals if typ(j) in ('income','contra_income') and j.date and j.date[:7]==f'{today.year}-{m:02d}'),ZERO))} for m in range(1,13)]
+ return page(req,s,'Dashboard',sales=sales,profit=sales-expenses,receivables=receivables,payables=payables,docs=docs[:8],doc_kinds=KINDS,months=months,top_expenses=top_expenses,profit_month={'income':current_sales,'expenses':current_expenses,'profit':current_sales-current_expenses},overdue_receivables=due['sale'],overdue_payables=due['purchase'])
 @app.get('/register')
 def regpage(req:Request,s=Depends(db)):return page(req,s,'Daftar')
 @app.post('/register')
@@ -512,7 +567,7 @@ async def form_payload(req,s,cid,kind):
    master(s,cid,'item',int(iid))
    rows.append({'item_id':int(iid),'qty':str(qty),'price':str(price),'tax_rate':str(rate),'discount':str(discount)})
   if not rows:raise HTTPException(400,'Tambahkan minimal satu barang/jasa')
-  p={'items':rows,'control_account':(form.get('control_account') or ('1100' if kind.startswith('sale') else '2000'))}
+  p={'items':rows,'control_account':(form.get('control_account') or ('1100' if kind.startswith('sale') else '2000')),'invoice_discount':str(form.get('invoice_discount') or '0'),'due_date':str(form.get('due_date') or '')}
   if kind.endswith('return'):p['source_id']=int(form.get('source_id') or 0)
   return p
  if kind=='journal':
@@ -654,7 +709,7 @@ def print_sale(req:Request,did:int,print_type:str,s=Depends(db)):
  for idx,line in enumerate(payload.get('items',[]),1):
   if y<110:pdf.showPage();header()
   item=master(s,u.company_id,'item',int(line['item_id']))
-  q=Decimal(str(line['qty']));price=dec(line['price']);base=dec(q*price)-dec(line.get('discount',0));vat=dec(base*dec(line.get('tax_rate',0))/100)
+  q=Decimal(str(line['qty']));price=dec(line['price']);base=dec(q*price)-dec(line.get('discount',0))-dec(line.get('posted_invoice_discount',0));vat=dec(base*dec(line.get('tax_rate',0))/100)
   subtotal+=base;tax+=vat
   name=item.name[:42]
   txt(margin,y,str(idx),9);txt(margin+32,y,name,9)
@@ -766,12 +821,14 @@ def report(req:Request,name:str,format:str='html',start:str='',end:str='',accoun
    p.drawString(35,y,' | '.join(str(v)[:30] for v in r)[:115]);y-=15
   p.save();out.seek(0);return StreamingResponse(out,media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="{name}.pdf"'})
  return page(req,s,'Laporan '+name,report_name=name,heads=heads,rows=data)
+@app.get('/settings-page')
+def settings_page(req:Request,s=Depends(db)):
+ u=user(req,s);authorize(s,u,'read','settings');return page(req,s,'Pengaturan Tema',theme_settings=True)
 @app.post('/settings')
-def settings(req:Request,theme:str=Form(...),locked_through:str=Form(''),s=Depends(db)):
- u=user(req,s);c=s.get(Company,u.company_id)
+def settings(req:Request,theme:str=Form(...),s=Depends(db)):
+ u=user(req,s);authorize(s,u,'manage','settings');c=s.get(Company,u.company_id)
  if theme not in ('ocean','emerald','dark','sand'):raise HTTPException(400,'Tema tidak dikenal')
- if locked_through:date.fromisoformat(locked_through)
- c.theme=theme;c.locked_through=locked_through;s.commit();return go('/')
+ c.theme=theme;audit(s,u,'update','settings',c.id,'Ubah tema');s.commit();return go('/settings-page')
 @app.post('/assets/{asset_id}/depreciate')
 def depreciate(req:Request,asset_id:int,period:str=Form(...),s=Depends(db)):
  u=user(req,s);a=master(s,u.company_id,'asset',asset_id)

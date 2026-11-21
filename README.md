@@ -98,3 +98,11 @@ Registrasi, halaman master, form transaksi, posting pembelian + PPN, posting pen
 - Demi keamanan moving-average, transaksi yang memengaruhi stok hanya dapat dibuka/dihapus jika tidak ada mutasi stok sesudahnya; transaksi yang sudah memiliki retur tidak dapat dibuka/dihapus.
 - Transaksi dalam periode terkunci tidak dapat dibuka/dihapus. Aktivitas reopen/delete dicatat pada Audit Trail.
 - Sebelum menggunakan pada database produksi, lakukan backup dan uji skenario transaksi berantai di staging.
+
+## v1.1 Beta — Dashboard dan Diskon Faktur
+- Dashboard: grafik 5 akun beban terbesar bulan berjalan, grafik ringkas pendapatan/beban/laba bulan berjalan, 10 estimasi piutang dan hutang jatuh tempo terbesar.
+- Jatuh tempo diinput di faktur penjualan/pembelian; dokumen lama tanpa tanggal jatuh tempo diasumsikan 30 hari dari tanggal faktur. Karena pelunasan belum ditautkan langsung ke nomor faktur, daftar jatuh tempo merupakan **estimasi** dengan alokasi pembayaran ke faktur tertua per pelanggan/pemasok dan akun pengendali. Jangan menganggap daftar ini sebagai aging piutang/hutang yang sudah direkonsiliasi.
+- Diskon faktur nominal pada bagian bawah faktur penjualan/pembelian. Dialokasikan proporsional ke nilai bersih tiap baris sebelum PPN sehingga mengurangi pendapatan/biaya perolehan persediaan; jurnal retur menyesuaikan diskon faktur asal secara proporsional.
+- Pengaturan tema dipindahkan dari dashboard ke submenu Pengaturan. Fitur penguncian periode tidak dihapus dari mesin jurnal maupun database; hanya kontrolnya tidak ditampilkan pada dashboard.
+- Buku Besar Pembantu dipindah ke submenu Laporan. Master COA, pelanggan, pemasok, barang/jasa lebih ringkas pada HP.
+- Tetap **BETA**. Uji dahulu pada database staging, backup PostgreSQL sebelum deploy. Dashboard jatuh tempo bukan rekonsiliasi pembayaran faktur; pembukuan multi-tenant dan seluruh role tetap memerlukan audit keamanan.
