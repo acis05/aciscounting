@@ -1,4 +1,4 @@
-import os, json, io, csv, secrets, base64
+import os, json, io, csv, secrets, base64, hmac
 from datetime import datetime, date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from contextlib import contextmanager
@@ -7,7 +7,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse, Response, HTM
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, Numeric, Text, Boolean, UniqueConstraint, func
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, Numeric, Text, Boolean, UniqueConstraint, func, or_
 from sqlalchemy.orm import declarative_base, sessionmaker
 from argon2 import PasswordHasher
 from openpyxl import Workbook, load_workbook
@@ -29,9 +29,9 @@ engine=create_engine(DB,pool_pre_ping=True,connect_args={'check_same_thread':Fal
 Session=sessionmaker(bind=engine,expire_on_commit=False)
 Base=declarative_base(); ph=PasswordHasher()
 class User(Base):
- __tablename__='users';id=Column(Integer,primary_key=True);email=Column(String(200),unique=True,nullable=False);name=Column(String(120));password=Column(String(300));company_id=Column(Integer,ForeignKey('companies.id'))
+ __tablename__='users';id=Column(Integer,primary_key=True);email=Column(String(200),unique=True,nullable=False);name=Column(String(120));password=Column(String(300));company_id=Column(Integer,ForeignKey('companies.id'));suspended=Column(Boolean,default=False);must_change_password=Column(Boolean,default=False)
 class Company(Base):
- __tablename__='companies';id=Column(Integer,primary_key=True);name=Column(String(150),nullable=False);theme=Column(String(30),default='ocean');locked_through=Column(String(10),default='');cutoff_date=Column(String(10),default='')
+ __tablename__='companies';id=Column(Integer,primary_key=True);name=Column(String(150),nullable=False);theme=Column(String(30),default='ocean');locked_through=Column(String(10),default='');cutoff_date=Column(String(10),default='');plan=Column(String(10),default='free');pro_until=Column(String(10),default='')
 class Master(Base):
  __tablename__='masters';id=Column(Integer,primary_key=True);company_id=Column(Integer,index=True,nullable=False);kind=Column(String(25),nullable=False);code=Column(String(60),nullable=False);name=Column(String(180),nullable=False);extra=Column(Text,default='{}');active=Column(Boolean,default=True);__table_args__=(UniqueConstraint('company_id','kind','code'),)
 class Document(Base):
@@ -56,9 +56,12 @@ from sqlalchemy import inspect, text as sqltext
 with engine.begin() as connection:
  if 'companies' in inspect(connection).get_table_names() and 'cutoff_date' not in {c['name'] for c in inspect(connection).get_columns('companies')}:
   connection.execute(sqltext("ALTER TABLE companies ADD COLUMN cutoff_date VARCHAR(10) DEFAULT ''"))
+ for table,col,sql in [('users','suspended','BOOLEAN DEFAULT FALSE'),('users','must_change_password','BOOLEAN DEFAULT FALSE'),('companies','plan',"VARCHAR(10) DEFAULT 'free'"),('companies','pro_until',"VARCHAR(10) DEFAULT ''")]:
+  if table in inspect(connection).get_table_names() and col not in {c['name'] for c in inspect(connection).get_columns(table)}:
+   connection.execute(sqltext(f'ALTER TABLE {table} ADD COLUMN {col} {sql}'))
  if 'print_templates' in inspect(connection).get_table_names() and 'settings' not in {c['name'] for c in inspect(connection).get_columns('print_templates')}:
   connection.execute(sqltext("ALTER TABLE print_templates ADD COLUMN settings TEXT DEFAULT '{}'"))
-app=FastAPI(title='aciscounting.id',version='1.5.0')
+app=FastAPI(title='aciscounting.id',version='1.6.0')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SECRET_KEY','DEV_ONLY_CHANGE_THIS_SECRET'),https_only=os.getenv('COOKIE_SECURE','false').lower()=='true',same_site='lax')
 ROOT=os.path.dirname(__file__);tplfilter=lambda v: json.loads(v or '{}');app.mount('/static',StaticFiles(directory=ROOT+'/static'),name='static');tpl=Jinja2Templates(directory=ROOT+'/templates');tpl.env.filters['from_json']=tplfilter
 @app.exception_handler(HTTPException)
@@ -76,7 +79,49 @@ def db():
 def user(req,s):
  uid=req.session.get('uid');u=s.get(User,uid) if uid else None
  if not u:raise HTTPException(401,'Silakan login terlebih dahulu')
+ if u.suspended:raise HTTPException(403,'Akun dinonaktifkan. Hubungi administrator aciscounting.id')
+ if u.must_change_password and req.url.path not in ('/account/password','/logout'):
+  raise HTTPException(403,'Password sementara harus diganti terlebih dahulu di /account/password')
  return u
+FREE_LIMITS={'item':20,'customer':30,'supplier':30,'warehouse':1}
+FREE_MONTHLY={'sale':20,'purchase':20,'cash_in':60,'cash_out':60,'bank_in':60,'bank_out':60,'journal':30}
+def is_pro(s,cid):
+ c=s.get(Company,cid)
+ return bool(c and c.plan=='pro' and c.pro_until and c.pro_until>=date.today().isoformat())
+def enforce_master_limit(s,cid,kind,additional=1):
+ if is_pro(s,cid):
+  if kind=='item' and (s.query(func.count(Master.id)).filter_by(company_id=cid,kind=kind).scalar() or 0)+additional>2000:raise HTTPException(403,'Batas PRO 2000 barang/jasa')
+  if kind=='warehouse' and (s.query(func.count(Master.id)).filter_by(company_id=cid,kind=kind).scalar() or 0)+additional>3:raise HTTPException(403,'Batas PRO 3 gudang')
+  return
+ if kind not in FREE_LIMITS:return
+ current=s.query(func.count(Master.id)).filter_by(company_id=cid,kind=kind).scalar() or 0
+ if current+additional>FREE_LIMITS[kind]:raise HTTPException(403,f'Batas FREE {kind}: {FREE_LIMITS[kind]} data. Upgrade PRO untuk menambah.')
+def enforce_document_limit(s,cid,kind,date_value,exclude_id=None):
+ if is_pro(s,cid):
+  if kind in ('sale','purchase'):
+   count=s.query(func.count(Document.id)).filter(Document.company_id==cid,Document.kind.in_(('sale','purchase')),Document.date>=date_value[:7]+'-01',Document.date<=date_value[:7]+'-31').scalar() or 0
+   if count>=1000:raise HTTPException(403,'Batas PRO 1000 faktur/bulan')
+  return
+ # Cash/bank quota is shared across all four cash/bank document types.
+ if kind in ('cash_in','cash_out','bank_in','bank_out'):
+  kinds=('cash_in','cash_out','bank_in','bank_out');limit=60;label='Kas & Bank'
+ elif kind in ('sale','purchase'):
+  kinds=('sale','purchase');limit=20;label='Faktur penjualan/pembelian'
+ elif kind=='journal':kinds=('journal',);limit=30;label='Jurnal umum'
+ else:return
+ q=s.query(func.count(Document.id)).filter(Document.company_id==cid,Document.kind.in_(kinds),Document.date>=date_value[:7]+'-01',Document.date<=(date_value[:7]+'-31'))
+ if exclude_id:q=q.filter(Document.id!=exclude_id)
+ if (q.scalar() or 0)>=limit:raise HTTPException(403,f'Kuota FREE {label} {limit} transaksi/bulan sudah habis. Upgrade PRO.')
+
+def admin_required(req):
+ if not req.session.get('platform_admin'):raise HTTPException(403,'Login administrator diperlukan')
+ if not os.getenv('ADMIN_EMAIL') or not os.getenv('ADMIN_PASSWORD_HASH'):
+  raise HTTPException(503,'Administrator belum dikonfigurasi')
+def admin_post_origin(req):
+ origin=req.headers.get('origin')
+ if origin and origin.rstrip('/')!=str(req.base_url).rstrip('/'):
+  raise HTTPException(403,'Origin permintaan tidak valid')
+
 def owned(s,cls,id,cid):
  x=s.get(cls,id)
  if not x or x.company_id!=cid:raise HTTPException(404,'Data tidak ditemukan')
@@ -103,7 +148,7 @@ def page(req,s,title,**ctx):
  try:u=user(req,s)
  except HTTPException:u=None
  c=s.get(Company,u.company_id) if u else None
- return tpl.TemplateResponse('app.html',{'request':req,'title':title,'user':u,'company':c,'cash':cash,'today':date.today().isoformat(),**ctx})
+ return tpl.TemplateResponse('app.html',{'request':req,'title':title,'user':u,'company':c,'cash':cash,'today':date.today().isoformat(),'plan_label':('PRO' if u and is_pro(s,u.company_id) else 'FREE'),'pro_until':(c.pro_until if c else ''),**ctx})
 ACCOUNTS=[('1000','Kas','cash'),('1010','Bank','bank'),('1100','Piutang Usaha','receivable'),('1200','Persediaan','asset'),('1500','Aset Tetap','asset'),('1590','Akumulasi Penyusutan','contra_asset'),('2000','Hutang Usaha','payable'),('3000','Modal','equity'),('3090','Opening Balance Equity','equity'),('4000','Penjualan','income'),('4010','Retur Penjualan','contra_income'),('5000','HPP','cogs'),('6000','Beban Operasional','expense'),('6100','Beban Penyusutan','expense'),('1201','Selisih Persediaan','expense'),('1150','PPN Masukan','asset'),('2100','PPN Keluaran','liability')]
 def seed(s,cid):
  for code,name,typ in ACCOUNTS:s.add(Master(company_id=cid,kind='coa',code=code,name=name,extra=json.dumps({'type':typ,'system_code':code})))
@@ -181,6 +226,7 @@ def stockout(s,doc,item,warehouse,qty):
 
 def post(s,doc):
  if doc.status!='draft':raise HTTPException(400,'Hanya draft yang dapat diposting')
+ if doc.kind=='depreciation':raise HTTPException(403,'Aset tetap dinonaktifkan')
  ensure_system_coas(s,doc.company_id)
  c=owned(s,Company,doc.company_id,doc.company_id) if False else s.get(Company,doc.company_id)
  if c.cutoff_date and doc.date<c.cutoff_date:raise HTTPException(400,'Tanggal transaksi sebelum tanggal mulai pakai aplikasi')
@@ -312,8 +358,8 @@ def post(s,doc):
     master(s,doc.company_id,'customer' if account_type(acc)=='receivable' else 'supplier',party)
  lines(s,doc,E);doc.status='posted'
 
-KINDS={'cash_in':'Kas Masuk','cash_out':'Kas Keluar','bank_in':'Bank Masuk','bank_out':'Bank Keluar','sale':'Faktur Penjualan','sale_receipt':'Penerimaan Penjualan','sale_return':'Retur Penjualan','purchase':'Faktur Pembelian','purchase_payment':'Pembayaran Pembelian','purchase_return':'Retur Pembelian','transfer':'Transfer Gudang','adjust':'Penyesuaian Persediaan','journal':'Jurnal Umum','depreciation':'Penyusutan'}
-MASTER_KINDS={'coa':'COA','customer':'Pelanggan','supplier':'Pemasok','item':'Barang / Jasa','warehouse':'Gudang','asset':'Aset Tetap','unit':'Satuan','salesman':'Salesman'}
+KINDS={'cash_in':'Kas Masuk','cash_out':'Kas Keluar','bank_in':'Bank Masuk','bank_out':'Bank Keluar','sale':'Faktur Penjualan','sale_receipt':'Penerimaan Penjualan','sale_return':'Retur Penjualan','purchase':'Faktur Pembelian','purchase_payment':'Pembayaran Pembelian','purchase_return':'Retur Pembelian','transfer':'Transfer Gudang','adjust':'Penyesuaian Persediaan','journal':'Jurnal Umum'}
+MASTER_KINDS={'coa':'COA','customer':'Pelanggan','supplier':'Pemasok','item':'Barang / Jasa','warehouse':'Gudang','unit':'Satuan','salesman':'Salesman'}
 @app.get('/')
 def home(req:Request,s=Depends(db)):
  try:u=user(req,s)
@@ -435,7 +481,8 @@ def master_import_template(req:Request,kind:str,s=Depends(db)):
 
 @app.post('/masters/{kind}/import')
 async def master_import(req:Request,kind:str,file:UploadFile=File(...),s=Depends(db)):
- u=user(req,s);authorize(s,u,'write','masters')
+ u=user(req,s)
+ if not is_pro(s,u.company_id):raise HTTPException(403,'Impor Excel hanya tersedia di PRO');authorize(s,u,'write','masters')
  if kind not in IMPORT_KINDS:raise HTTPException(404)
  raw=await file.read(2_000_001)
  if len(raw)>2_000_000:raise HTTPException(400,'Ukuran Excel maksimal 2 MB')
@@ -478,6 +525,7 @@ async def master_import(req:Request,kind:str,file:UploadFile=File(...),s=Depends
  wb.close()
  if errors:raise HTTPException(400,'Impor dibatalkan, tidak ada data tersimpan. '+ '; '.join(errors[:12]))
  if not prepared:raise HTTPException(400,'Tidak ada baris data untuk diimpor')
+ enforce_master_limit(s,u.company_id,kind,len(prepared))
  s.add_all(prepared);audit(s,u,'import',kind,0,f'{len(prepared)} master dari Excel');s.commit()
  return go('/masters/'+kind+'?imported='+str(len(prepared)))
 
@@ -487,6 +535,7 @@ def regpage(req:Request,s=Depends(db)):return page(req,s,'Daftar')
 def register(req:Request,name:str=Form(...),email:str=Form(...),password:str=Form(...),company:str=Form(...),s=Depends(db)):
  email=email.lower().strip()
  if len(password)<10:raise HTTPException(400,'Password minimal 10 karakter')
+ if not name.strip() or not company.strip():raise HTTPException(400,'Nama dan perusahaan wajib diisi')
  if s.query(User).filter_by(email=email).first():raise HTTPException(400,'Email sudah terdaftar')
  c=Company(name=company[:150]);s.add(c);s.flush();u=User(name=name[:120],email=email,password=ph.hash(password),company_id=c.id);s.add(u);seed(s,c.id);s.commit();req.session.clear();req.session['uid']=u.id;return go('/')
 @app.get('/login')
@@ -494,8 +543,12 @@ def loginpage(req:Request,s=Depends(db)):return page(req,s,'Login')
 @app.post('/login')
 def login(req:Request,email:str=Form(...),password:str=Form(...),s=Depends(db)):
  u=s.query(User).filter_by(email=email.lower().strip()).first()
- if not u or not ph.verify(u.password,password):raise HTTPException(401,'Email atau password salah')
- req.session.clear();req.session['uid']=u.id;return go('/')
+ if not u:raise HTTPException(401,'Email atau password salah')
+ try:valid=ph.verify(u.password,password)
+ except Exception:valid=False
+ if not valid:raise HTTPException(401,'Email atau password salah')
+ if u.suspended:raise HTTPException(403,'Akun ditangguhkan, hubungi admin')
+ req.session.clear();req.session['uid']=u.id;return go('/account/password' if u.must_change_password else '/')
 @app.post('/logout')
 def logout(req:Request):req.session.clear();return go('/login')
 @app.get('/masters/{kind}')
@@ -608,6 +661,7 @@ async def master_extra(req,kind):
   data['unit']=unit
   return data
  if kind=='asset':
+  raise HTTPException(404,'Modul aset tetap dinonaktifkan')
   cost=dec(f.get('asset_cost'));residual=dec(f.get('asset_residual'))
   months=int(f.get('asset_months') or 0)
   if months<1 or cost<residual:raise HTTPException(400,'Data aset tidak valid')
@@ -622,6 +676,7 @@ async def master_add(req:Request,kind:str,code:str=Form(...),name:str=Form(...),
  req.state.db=s;req.state.company_id=u.company_id
  data=await master_extra(req,kind)
  if s.query(Master).filter_by(company_id=u.company_id,kind=kind,code=code.strip()).first():raise HTTPException(400,'Kode sudah dipakai')
+ enforce_master_limit(s,u.company_id,kind)
  x=Master(company_id=u.company_id,kind=kind,code=code.strip()[:60],name=name.strip()[:180],extra=json.dumps(data));s.add(x);s.flush()
  f=await req.form()
  if kind in ('coa','customer','supplier','item') and (dec(f.get('opening_balance') or 0) or dec(f.get('opening_qty') or 0)):
@@ -689,7 +744,8 @@ async def save_cutoff(req:Request,s=Depends(db)):
 
 @app.get('/print-design')
 def print_design(req:Request,s=Depends(db)):
- u=user(req,s);authorize(s,u,'manage','print')
+ u=user(req,s)
+ if not is_pro(s,u.company_id):raise HTTPException(403,'Desain cetakan khusus tersedia di PRO');authorize(s,u,'manage','print')
  templates={x.kind:x for x in s.query(PrintTemplate).filter_by(company_id=u.company_id).all()}
  return page(req,s,'Desain Cetakan',print_templates=templates)
 @app.post('/print-design')
@@ -748,6 +804,8 @@ def access_page(req:Request,s=Depends(db)):
 @app.post('/access/add')
 def access_add(req:Request,name:str=Form(...),email:str=Form(...),password:str=Form(...),role:str=Form('viewer'),s=Depends(db)):
  u=user(req,s);authorize(s,u,'manage','access')
+ if not is_pro(s,u.company_id):raise HTTPException(403,'Multi-user hanya tersedia di PRO')
+ if s.query(func.count(User.id)).filter_by(company_id=u.company_id).scalar()>=3:raise HTTPException(403,'Batas PRO 3 pengguna')
  if role not in ('admin','accounting','sales','purchasing','viewer'):raise HTTPException(400,'Peran tidak valid')
  if len(password)<10:raise HTTPException(400,'Password minimal 10 karakter')
  if s.query(User).filter_by(email=email.strip().lower()).first():raise HTTPException(400,'Email sudah terdaftar')
@@ -824,9 +882,11 @@ async def form_payload(req,s,cid,kind):
 async def document_add(req:Request,kind:str,number:str=Form(...),date_value:str=Form(...,alias='date'),party_id:int=Form(0),warehouse_id:int=Form(0),memo:str=Form(''),payload:str=Form('{}'),s=Depends(db)):
  u=user(req,s)
  if kind not in KINDS:raise HTTPException(404)
+ if kind in ('transfer','adjust','sale_return','purchase_return') and not is_pro(s,u.company_id):raise HTTPException(403,'Fitur persediaan/retur tersedia di PRO')
  authorize(s,u,'write','documents')
  try:date.fromisoformat(date_value)
  except:raise HTTPException(400,'Tanggal tidak valid')
+ enforce_document_limit(s,u.company_id,kind,date_value)
  p=await form_payload(req,s,u.company_id,kind)
  if party_id:master(s,u.company_id,'customer' if kind in ('sale','sale_receipt','sale_return') else 'supplier' if kind in ('purchase','purchase_payment','purchase_return') else 'customer',party_id)
  if warehouse_id:master(s,u.company_id,'warehouse',warehouse_id)
@@ -881,6 +941,7 @@ async def document_edit(req:Request,kind:str,did:int,number:str=Form(...),date_v
  if x.kind!=kind or x.status!='draft':raise HTTPException(400,'Klik Edit pada transaksi terposting untuk membuka kembali sebagai Draft terlebih dahulu')
  try:date.fromisoformat(date_value)
  except:raise HTTPException(400,'Tanggal tidak valid')
+ if date_value[:7]!=x.date[:7]:enforce_document_limit(s,u.company_id,kind,date_value,exclude_id=x.id)
  p=await form_payload(req,s,u.company_id,kind)
  if party_id:master(s,u.company_id,'customer' if kind in ('sale','sale_receipt','sale_return') else 'supplier' if kind in ('purchase','purchase_payment','purchase_return') else 'customer',party_id)
  if warehouse_id:master(s,u.company_id,'warehouse',warehouse_id)
@@ -899,6 +960,10 @@ def document_delete(req:Request,kind:str,did:int,s=Depends(db)):
 def document_post(req:Request,kind:str,did:int,s=Depends(db)):
  u=user(req,s);authorize(s,u,'post','documents');x=owned(s,Document,did,u.company_id)
  if x.kind!=kind:raise HTTPException(404)
+ if not is_pro(s,u.company_id) and kind in ('sale','purchase'):
+  for line in json.loads(x.payload or '{}').get('items',[]):
+   item=master(s,u.company_id,'item',int(line.get('item_id') or 0))
+   if json.loads(item.extra or '{}').get('type','goods')=='goods':raise HTTPException(403,'Faktur barang dengan mutasi stok tersedia di PRO; paket FREE dapat memakai jasa')
  try:post(s,x);audit(s,u,'post','document',x.id,x.number);s.commit()
  except:s.rollback();raise
  return go('/documents/'+kind)
@@ -972,6 +1037,8 @@ def print_sale(req:Request,did:int,print_type:str,s=Depends(db)):
 @app.get('/reports/{name}')
 def report(req:Request,name:str,format:str='html',start:str='',end:str='',account_id:int=0,s=Depends(db)):
  u=user(req,s);authorize(s,u,'read','reports');cid=u.company_id
+ if name=='cashflow' and not is_pro(s,cid):raise HTTPException(403,'Laporan Arus Kas tersedia pada paket PRO')
+ if name in ('assets',):raise HTTPException(404,'Modul aset tetap tidak tersedia')
  if name=='bank':
   accounts=s.query(Master).filter_by(company_id=cid,kind='coa').order_by(Master.code).all()
   bank_accounts=[a for a in accounts if account_type(a) in ('cash','bank')]
@@ -1065,6 +1132,7 @@ def settings(req:Request,theme:str=Form(...),s=Depends(db)):
  c.theme=theme;audit(s,u,'update','settings',c.id,'Ubah tema');s.commit();return go('/settings-page')
 @app.post('/assets/{asset_id}/depreciate')
 def depreciate(req:Request,asset_id:int,period:str=Form(...),s=Depends(db)):
+ raise HTTPException(404,'Modul aset tetap dinonaktifkan')
  u=user(req,s);a=master(s,u.company_id,'asset',asset_id)
  try:period_date=date.fromisoformat(period+'-01')
  except:raise HTTPException(400,'Periode harus YYYY-MM')
@@ -1079,3 +1147,84 @@ def depreciate(req:Request,asset_id:int,period:str=Form(...),s=Depends(db)):
  amount=dec((cost-res)/life)
  if months==life:amount=(cost-res)-amount*(life-1)
  doc=Document(company_id=u.company_id,kind='depreciation',number=number,date=period_date.isoformat(),memo=f'Penyusutan {a.name} {period}',payload=json.dumps({'amount':str(amount),'asset_id':asset_id}));s.add(doc);s.flush();post(s,doc);s.commit();return go('/reports/assets')
+
+
+@app.get('/account/password')
+def change_password_page(req:Request,s=Depends(db)):
+ uid=req.session.get('uid');u=s.get(User,uid) if uid else None
+ if not u or u.suspended:raise HTTPException(401,'Silakan login')
+ return HTMLResponse('<!doctype html><html lang="id"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ganti Password</title><style>body{font-family:system-ui;background:#f2f7f3;padding:32px}form{max-width:420px;margin:8vh auto;background:white;padding:28px;border-radius:16px}input,button{box-sizing:border-box;width:100%;padding:12px;margin:8px 0}button{background:#0b8253;color:white;border:0;border-radius:8px}</style><form method="post"><h2>Ganti Password</h2><p>Masukkan password baru minimal 10 karakter.</p><input name="password" type="password" minlength="10" required autocomplete="new-password"><button>Simpan Password Baru</button></form></html>')
+@app.post('/account/password')
+def change_password(req:Request,password:str=Form(...),s=Depends(db)):
+ uid=req.session.get('uid');u=s.get(User,uid) if uid else None
+ if not u or u.suspended:raise HTTPException(401,'Silakan login')
+ if len(password)<10:raise HTTPException(400,'Password minimal 10 karakter')
+ u.password=ph.hash(password);u.must_change_password=False;s.commit();return go('/')
+
+@app.get('/platform-admin/login')
+def platform_admin_login_page(req:Request):
+ return HTMLResponse('''<!doctype html><html lang="id"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin aciscounting.id</title><style>body{font-family:system-ui;background:#eef6f1;padding:28px}form{max-width:400px;background:white;border-radius:16px;padding:26px;margin:10vh auto}input,button{box-sizing:border-box;display:block;width:100%;padding:12px;margin:10px 0}button{background:#087e50;color:white;border:0;border-radius:8px}</style><form action="/platform-admin/login" method="post"><h2>Admin Platform</h2><label>Email Admin<input type="email" name="email" required></label><label>Password Admin<input type="password" name="password" required></label><button>Masuk</button></form></html>''')
+@app.post('/platform-admin/login')
+def platform_admin_login(req:Request,email:str=Form(...),password:str=Form(...)):
+ admin_email=os.getenv('ADMIN_EMAIL','').strip().lower();admin_hash=os.getenv('ADMIN_PASSWORD_HASH','')
+ if not admin_email or not admin_hash:raise HTTPException(503,'Atur ADMIN_EMAIL dan ADMIN_PASSWORD_HASH di Railway')
+ try:password_ok=ph.verify(admin_hash,password)
+ except Exception:password_ok=False
+ if not (hmac.compare_digest(email.lower().strip(),admin_email) and password_ok):raise HTTPException(401,'Kredensial administrator salah')
+ req.session.clear();req.session['platform_admin']=True;return go('/platform-admin')
+@app.post('/platform-admin/logout')
+def platform_admin_logout(req:Request):
+ admin_required(req);req.session.clear();return go('/platform-admin/login')
+
+def admin_html(req,s,notice=''):
+ admin_required(req)
+ companies=s.query(Company).order_by(Company.id.desc()).all()
+ users=s.query(User).order_by(User.id.desc()).all();users_by_company={}
+ for u in users:users_by_company.setdefault(u.company_id,[]).append(u)
+ out=['<!doctype html><html lang="id"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Panel Admin aciscounting.id</title><style>body{font:14px system-ui;background:#f3f7f4;color:#183a2c;margin:0;padding:24px}main{max-width:1150px;margin:auto}header{display:flex;justify-content:space-between}section{background:white;padding:20px;margin:16px 0;border-radius:14px;box-shadow:0 2px 10px #1231}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid #ddd;padding:9px}button,input{padding:8px;border-radius:6px}button{background:#087f51;color:white;border:0;cursor:pointer}form{display:inline-block;margin:3px}.muted{color:#65786d}.danger{background:#a33}.scroll{overflow:auto}</style><main><header><h1>Panel Admin aciscounting.id</h1><form action="/platform-admin/logout" method="post"><button>Keluar</button></form></header><p class="muted">Aktivasi PRO manual · Rp299.000/tahun · Akun baru otomatis FREE</p>']
+ if notice:out.append('<section>'+escape(notice)+'</section>')
+ out.append('<section class="scroll"><table><tr><th>Perusahaan</th><th>Pengguna</th><th>Paket</th><th>PRO sampai</th><th>Tindakan</th></tr>')
+ for c in companies:
+  plan='PRO' if is_pro(s,c.id) else 'FREE'
+  out.append('<tr><td>'+escape(c.name)+'<br><small>#'+str(c.id)+'</small></td><td>')
+  for u in users_by_company.get(c.id,[]):
+   out.append('<div>'+escape(u.email)+' — '+escape(u.name or '')+(' (SUSPEND)' if u.suspended else '')+'<br>')
+   out.append('<form method="post" action="/platform-admin/user/'+str(u.id)+'/reset"><button>Reset Password</button></form>')
+   out.append('<form method="post" action="/platform-admin/user/'+str(u.id)+'/suspend"><button class="danger">'+('Aktifkan' if u.suspended else 'Suspend')+'</button></form></div>')
+  out.append('</td><td>'+plan+'</td><td>'+escape(c.pro_until or '-')+'</td><td>')
+  out.append('<form method="post" action="/platform-admin/company/'+str(c.id)+'/pro"><button>Aktivasi / Perpanjang PRO 1 Tahun</button></form>')
+  out.append('<form method="post" action="/platform-admin/company/'+str(c.id)+'/free"><button class="danger">Ubah ke FREE</button></form></td></tr>')
+ out.append('</table></section></main></html>')
+ return HTMLResponse(''.join(out))
+@app.get('/platform-admin')
+def platform_admin(req:Request,s=Depends(db)):return admin_html(req,s)
+@app.post('/platform-admin/company/{cid}/pro')
+def admin_activate_pro(req:Request,cid:int,s=Depends(db)):
+ admin_required(req);admin_post_origin(req)
+ c=s.get(Company,cid)
+ if not c:raise HTTPException(404)
+ base=max(date.today(),date.fromisoformat(c.pro_until)) if c.plan=='pro' and c.pro_until else date.today()
+ # One year from the activation/renewal baseline; leap day is handled.
+ try:expires=base.replace(year=base.year+1)
+ except ValueError:expires=base.replace(year=base.year+1,day=28)
+ c.plan='pro';c.pro_until=expires.isoformat();s.commit();return go('/platform-admin')
+@app.post('/platform-admin/company/{cid}/free')
+def admin_downgrade(req:Request,cid:int,s=Depends(db)):
+ admin_required(req);admin_post_origin(req)
+ c=s.get(Company,cid)
+ if not c:raise HTTPException(404)
+ c.plan='free';c.pro_until='';s.commit();return go('/platform-admin')
+@app.post('/platform-admin/user/{uid}/suspend')
+def admin_suspend(req:Request,uid:int,s=Depends(db)):
+ admin_required(req);admin_post_origin(req)
+ u=s.get(User,uid)
+ if not u:raise HTTPException(404)
+ u.suspended=not bool(u.suspended);s.commit();return go('/platform-admin')
+@app.post('/platform-admin/user/{uid}/reset')
+def admin_reset(req:Request,uid:int,s=Depends(db)):
+ admin_required(req);admin_post_origin(req)
+ u=s.get(User,uid)
+ if not u:raise HTTPException(404)
+ temporary=secrets.token_urlsafe(16);u.password=ph.hash(temporary);u.must_change_password=True;s.commit()
+ # Show once. Never write temporary passwords to audit logs.
+ return admin_html(req,s,'Password sementara untuk '+u.email+': '+temporary+' — Salin sekarang. Pengguna wajib mengganti password saat login.')
