@@ -123,3 +123,11 @@ Registrasi, halaman master, form transaksi, posting pembelian + PPN, posting pen
 - Detail Pelanggan dan Pemasok memiliki Alamat, Nama Kontak, Email.
 - Master Salesman (kode/nama) dan pilihan Salesman pada faktur penjualan (draft, edit, posting).
 - Sebelum deploy, backup database dan uji di staging.
+
+
+## v1.8
+- Format nominal Debit/Kredit pada Semua Jurnal: pemisah ribuan dan 2 desimal.
+- Neraca hanya filter Per Tanggal.
+- Laba (Rugi) tahun ini dihitung sejak 1 Januari tahun Per Tanggal; akumulasi tahun sebelumnya disajikan sebagai Laba Ditahan (reklasifikasi pada laporan, bukan jurnal tutup buku). Akun COA 3100 Laba Ditahan disediakan.
+- Tombol ekspor PDF/Excel selalu terlihat; untuk FREE dinonaktifkan (PRO). Backend tetap memblokir ekspor FREE.
+- PENTING: reklasifikasi laba ditahan pada Neraca bersifat virtual, belum jurnal penutupan tahunan. Lakukan review akuntansi sebelum produksi.

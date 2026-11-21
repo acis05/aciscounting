@@ -149,7 +149,7 @@ def page(req,s,title,**ctx):
  except HTTPException:u=None
  c=s.get(Company,u.company_id) if u else None
  return tpl.TemplateResponse('app.html',{'request':req,'title':title,'user':u,'company':c,'cash':cash,'today':date.today().isoformat(),'plan_label':('PRO' if u and is_pro(s,u.company_id) else 'FREE'),'pro_until':(c.pro_until if c else ''),**ctx})
-ACCOUNTS=[('1000','Kas','cash'),('1010','Bank','bank'),('1100','Piutang Usaha','receivable'),('1200','Persediaan','asset'),('1500','Aset Tetap','asset'),('1590','Akumulasi Penyusutan','contra_asset'),('2000','Hutang Usaha','payable'),('3000','Modal','equity'),('3090','Opening Balance Equity','equity'),('4000','Penjualan','income'),('4010','Retur Penjualan','contra_income'),('5000','HPP','cogs'),('6000','Beban Operasional','expense'),('6100','Beban Penyusutan','expense'),('1201','Selisih Persediaan','expense'),('1150','PPN Masukan','asset'),('2100','PPN Keluaran','liability')]
+ACCOUNTS=[('1000','Kas','cash'),('1010','Bank','bank'),('1100','Piutang Usaha','receivable'),('1200','Persediaan','asset'),('1500','Aset Tetap','asset'),('1590','Akumulasi Penyusutan','contra_asset'),('2000','Hutang Usaha','payable'),('3000','Modal','equity'),('3090','Opening Balance Equity','equity'),('3100','Laba Ditahan','equity'),('4000','Penjualan','income'),('4010','Retur Penjualan','contra_income'),('5000','HPP','cogs'),('6000','Beban Operasional','expense'),('6100','Beban Penyusutan','expense'),('1201','Selisih Persediaan','expense'),('1150','PPN Masukan','asset'),('2100','PPN Keluaran','liability')]
 def seed(s,cid):
  for code,name,typ in ACCOUNTS:s.add(Master(company_id=cid,kind='coa',code=code,name=name,extra=json.dumps({'type':typ,'system_code':code})))
  s.add(Master(company_id=cid,kind='warehouse',code='GD-01',name='Gudang Utama'))
@@ -1081,8 +1081,11 @@ def report(req:Request,name:str,format:str='html',start:str='',end:str='',accoun
   return page(req,s,title,report_name='bank',financial_rows=rows,financial_notes=[],report_start=start,report_end=end,report_account_id=account_id,report_accounts=bank_accounts,report_period=period)
  if name in ('profit','balance','ledger','cashflow'):
   today=date.today().isoformat();end=end or today;start=start or (today[:4]+'-01-01')
+  if name=='balance':start='0001-01-01'
   try:date.fromisoformat(start);date.fromisoformat(end)
   except ValueError:raise HTTPException(400,'Format tanggal tidak valid')
+  if name=='balance':
+   ensure_system_coas(s,cid);s.commit()
   accounts=s.query(Master).filter_by(company_id=cid,kind='coa').all()
   journals=s.query(Journal).filter_by(company_id=cid).order_by(Journal.date,Journal.id).all()
   documents=s.query(Document).filter_by(company_id=cid).all()

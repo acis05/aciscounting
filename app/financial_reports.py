@@ -68,17 +68,27 @@ def report_model(name,accounts,journals,documents,start,end,account_id=None):
  elif name=='balance':
   assets=group('ASET',('asset','contra_asset','cash','bank','receivable'),'debit',all_t)
   liabilities=group('LIABILITAS',('liability','payable'),'credit',all_t)
+  # Presentasi laba ditahan secara otomatis tanpa memodifikasi jurnal historis.
+  # Laba tahun sebelumnya direklasifikasi secara virtual untuk neraca; tidak double-count
+  # apabila perusahaan sudah melakukan jurnal penutupan pendapatan/beban.
   equity=group('EKUITAS',('equity',),'credit',all_t)
-  profit=Z
-  for a in accounts:
-   typ=account_type(a)
-   if typ=='income':profit+=balance(a,all_t,'credit')
-   elif typ=='contra_income':profit-=balance(a,all_t,'debit')
-   elif typ in ('expense','cogs'):profit-=balance(a,all_t,'debit')
-  add('Laba (Rugi) Akumulatif Belum Ditutup',profit,1)
-  add('JUMLAH LIABILITAS DAN EKUITAS',liabilities+equity+profit,kind='grand')
-  add('SELISIH KESEIMBANGAN',assets-liabilities-equity-profit,kind='check')
-  notes.append('Laba akumulatif dihitung dari jurnal pendapatan/beban sejak awal pencatatan; akun penutupan laba dan saldo awal perlu ditinjau.')
+  year_start=f'{end[:4]}-01-01'
+  prior=totals(j for j in entries if j.date<year_start)
+  current_year=totals(j for j in entries if j.date>=year_start)
+  def pnl(balances):
+   result=Z
+   for a in accounts:
+    typ=account_type(a)
+    if typ=='income':result+=balance(a,balances,'credit')
+    elif typ=='contra_income':result-=balance(a,balances,'debit')
+    elif typ in ('expense','cogs'):result-=balance(a,balances,'debit')
+   return result
+  retained=pnl(prior);profit=pnl(current_year)
+  add('Laba Ditahan — Akumulasi Tahun Sebelumnya',retained,1)
+  add('Laba (Rugi) tahun ini',profit,1)
+  add('JUMLAH LIABILITAS DAN EKUITAS',liabilities+equity+retained+profit,kind='grand')
+  add('SELISIH KESEIMBANGAN',assets-liabilities-equity-retained-profit,kind='check')
+  notes.append('Laba tahun sebelumnya ditampilkan sebagai Laba Ditahan secara otomatis pada Neraca; belum membentuk jurnal tutup buku. Jika sudah ada jurnal penutupan manual, jangan lakukan penutupan ulang.')
  elif name=='ledger':
   selected=sorted((a for a in accounts if account_id is None or a.id==account_id),key=lambda x:x.code)
   if account_id is not None and not selected:raise HTTPException(404,'Akun tidak ditemukan')

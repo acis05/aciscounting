@@ -52,3 +52,5 @@ html{font-size:15px;-webkit-text-size-adjust:100%}body{font-family:Inter,ui-sans
 @media(max-width:650px){.master-list-card .scroll{overflow-x:auto!important}.compact-master{display:table!important;min-width:380px!important}.compact-master thead{display:table-header-group}.compact-master tbody{display:table-row-group!important}.compact-master tr{display:table-row!important;padding:0!important;border:0!important}.compact-master th,.compact-master td{display:table-cell!important;grid-column:auto!important;padding:8px 6px!important;vertical-align:middle}.compact-master td:nth-child(3),.compact-master td:nth-child(4){display:table-cell!important}.compact-master td:last-child{white-space:nowrap}.chart-col{min-width:28px}.chart-col>strong{font-size:8px}}
 
 .nav-sub.pro-locked{opacity:.65}
+
+button:disabled,.actions button:disabled{background:#e5e7eb!important;color:#737b86!important;border-color:#d4d7dc!important;cursor:not-allowed!important;opacity:.9;box-shadow:none!important}
