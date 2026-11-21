@@ -61,7 +61,7 @@ with engine.begin() as connection:
    connection.execute(sqltext(f'ALTER TABLE {table} ADD COLUMN {col} {sql}'))
  if 'print_templates' in inspect(connection).get_table_names() and 'settings' not in {c['name'] for c in inspect(connection).get_columns('print_templates')}:
   connection.execute(sqltext("ALTER TABLE print_templates ADD COLUMN settings TEXT DEFAULT '{}'"))
-app=FastAPI(title='aciscounting.id',version='1.6.0')
+app=FastAPI(title='aciscounting.id',version='2.0.0')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SECRET_KEY','DEV_ONLY_CHANGE_THIS_SECRET'),https_only=os.getenv('COOKIE_SECURE','false').lower()=='true',same_site='lax')
 ROOT=os.path.dirname(__file__);tplfilter=lambda v: json.loads(v or '{}');app.mount('/static',StaticFiles(directory=ROOT+'/static'),name='static');tpl=Jinja2Templates(directory=ROOT+'/templates');tpl.env.filters['from_json']=tplfilter
 @app.exception_handler(HTTPException)
@@ -119,7 +119,14 @@ def admin_required(req):
   raise HTTPException(503,'Administrator belum dikonfigurasi')
 def admin_post_origin(req):
  origin=req.headers.get('origin')
- if origin and origin.rstrip('/')!=str(req.base_url).rstrip('/'):
+ if not origin:return
+ # Railway terminates TLS at its proxy: request.base_url can be internal HTTP.
+ # Validate against the browser-facing forwarded host and scheme, not the internal URL.
+ from urllib.parse import urlsplit
+ parsed=urlsplit(origin)
+ public_host=(req.headers.get('x-forwarded-host') or req.headers.get('host') or '').split(',')[0].strip().lower()
+ public_scheme=(req.headers.get('x-forwarded-proto') or req.url.scheme).split(',')[0].strip().lower()
+ if parsed.scheme not in ('https','http') or parsed.netloc.lower()!=public_host or parsed.scheme!=public_scheme:
   raise HTTPException(403,'Origin permintaan tidak valid')
 
 def owned(s,cls,id,cid):
@@ -558,7 +565,16 @@ def masters(req:Request,kind:str,s=Depends(db)):
  if kind not in MASTER_KINDS:raise HTTPException(404)
  if kind in ('coa','item'):ensure_system_coas(s,u.company_id);s.commit()
  items=s.query(Master).filter_by(company_id=u.company_id,kind=kind).order_by(Master.code).all()
- return page(req,s,MASTER_KINDS[kind],items=items,kind=kind,kind_label=MASTER_KINDS[kind],accounts=s.query(Master).filter_by(company_id=u.company_id,kind='coa').order_by(Master.code).all(),opening_warehouses=s.query(Master).filter_by(company_id=u.company_id,kind='warehouse').all(),units=s.query(Master).filter_by(company_id=u.company_id,kind='unit').order_by(Master.name).all(),master_summary=master_summaries(s,u.company_id,kind,items))
+ return page(req,s,MASTER_KINDS[kind],items=items,kind=kind,kind_label=MASTER_KINDS[kind],accounts=s.query(Master).filter_by(company_id=u.company_id,kind='coa').order_by(Master.code).all(),opening_warehouses=s.query(Master).filter_by(company_id=u.company_id,kind='warehouse').all(),units=s.query(Master).filter_by(company_id=u.company_id,kind='unit').order_by(Master.name).all(),master_summary=master_summaries(s,u.company_id,kind,items),coa_balances=coa_balance_summaries(s,u.company_id,items) if kind=='coa' else {})
+
+def coa_balance_summaries(s,cid,items):
+ totals={a.id:ZERO for a in items}
+ for aid,debit,credit in s.query(Journal.account_id,func.sum(Journal.debit),func.sum(Journal.credit)).filter_by(company_id=cid).group_by(Journal.account_id):
+  if aid in totals:
+   account=next(a for a in items if a.id==aid)
+   net=dec(debit)-dec(credit)
+   totals[aid]= -net if account_type(account) in ('liability','equity','income','contra_asset','payable') else net
+ return totals
 
 def master_summaries(s,cid,kind,items):
  result={x.id:{'balance':ZERO,'qty':ZERO} for x in items}
@@ -1052,6 +1068,7 @@ def report(req:Request,name:str,format:str='html',start:str='',end:str='',accoun
  u=user(req,s);authorize(s,u,'read','reports');cid=u.company_id
  if format not in ('html','xlsx','pdf'):raise HTTPException(400,'Format laporan tidak valid')
  if format in ('xlsx','pdf') and not is_pro(s,cid):raise HTTPException(403,'Ekspor Excel dan PDF hanya tersedia pada paket PRO')
+ if name=='valuation' and not is_pro(s,cid):raise HTTPException(403,'Laporan Valuasi Persediaan khusus paket PRO')
  if name=='cashflow' and not is_pro(s,cid):raise HTTPException(403,'Laporan Arus Kas tersedia pada paket PRO')
  if name in ('assets',):raise HTTPException(404,'Modul aset tetap tidak tersedia')
  if name=='bank':
@@ -1112,16 +1129,32 @@ def report(req:Request,name:str,format:str='html',start:str='',end:str='',accoun
    elif name=='balance':heads=['Kode','Akun','Saldo (Debit - Kredit)'];data=[[x.code,x.name,float(totals[x.id][0]-totals[x.id][1])] for x in coa_rows if json.loads(x.extra or '{}').get('type') in ('asset','contra_asset','liability','equity')]
    else:heads=['Aktivitas','Jumlah'];data=[['Kas dan Bank - Saldo Bersih',float(sum((D(x.debit)-D(x.credit) for x in js if system_code(am[x.account_id]) in ('1000','1010')),ZERO))]]
  elif name in ('stock','valuation'):
-  heads=['Barang','Gudang','Qty','Nilai'] if name=='stock' else ['Kode Barang','Nama Barang','Total Qty','Nilai Persediaan']
+  today=date.today().isoformat();end=end or today;start=start or today[:4]+'-01-01'
+  try:date.fromisoformat(start);date.fromisoformat(end)
+  except ValueError:raise HTTPException(400,'Tanggal tidak valid')
+  if start>end:raise HTTPException(400,'Periode tidak valid')
+  # All movement values come from posted Stock rows; opening is cumulative before start.
+  heads=(['Kode','Barang','Gudang','Qty Awal','Qty Masuk','Qty Keluar','Qty Akhir'] if name=='stock' else
+         ['Kode','Barang','Qty Awal','Nilai Awal','Qty Masuk','Nilai Masuk','Qty Keluar','Nilai Keluar','Qty Akhir','Nilai Akhir'])
   data=[]
-  if name=='stock':
-   for iid,wid in sorted({(x.item_id,x.warehouse_id) for x in ss}):
-    q=sum((D(x.qty) for x in ss if x.item_id==iid and x.warehouse_id==wid),D(0));v=sum((D(x.value) for x in ss if x.item_id==iid and x.warehouse_id==wid),D(0))
-    data.append([s.get(Master,iid).name,s.get(Master,wid).name,float(q),float(v)])
-  else:
-   for iid in sorted({x.item_id for x in ss}):
-    item=s.get(Master,iid);q=sum((D(x.qty) for x in ss if x.item_id==iid),D(0));v=sum((D(x.value) for x in ss if x.item_id==iid),D(0))
-    data.append([item.code,item.name,float(q),float(v)])
+  goods={x.id:x for x in s.query(Master).filter_by(company_id=cid,kind='item').all() if json.loads(x.extra or '{}').get('type','goods')=='goods'}
+  warehouses={x.id:x for x in s.query(Master).filter_by(company_id=cid,kind='warehouse').all()}
+  groups={}
+  for st in ss:
+   if st.item_id not in goods or st.date>end:continue
+   key=(st.item_id,st.warehouse_id) if name=='stock' else st.item_id
+   agg=groups.setdefault(key,{'oq':ZERO,'ov':ZERO,'iq':ZERO,'iv':ZERO,'outq':ZERO,'outv':ZERO})
+   q=D(str(st.qty or 0));v=D(str(st.value or 0))
+   if st.date<start:agg['oq']+=q;agg['ov']+=v
+   elif q>=0:agg['iq']+=q;agg['iv']+=v
+   else:agg['outq']+=-q;agg['outv']+=-v
+  for key,agg in sorted(groups.items(),key=lambda z:(goods[z[0][0] if name=='stock' else z[0]].code,str(z[0]))):
+   iid,wid=key if name=='stock' else (key,None)
+   item=goods[iid];finalq=agg['oq']+agg['iq']-agg['outq'];finalv=agg['ov']+agg['iv']-agg['outv']
+   if name=='stock':
+    data.append([item.code,item.name,warehouses[wid].name if wid in warehouses else '—',float(agg['oq']),float(agg['iq']),float(agg['outq']),float(finalq)])
+   else:
+    data.append([item.code,item.name,float(agg['oq']),float(agg['ov']),float(agg['iq']),float(agg['iv']),float(agg['outq']),float(agg['outv']),float(finalq),float(finalv)])
  elif name in ('receivables','payables'):
   code='1100' if name=='receivables' else '2000';heads=['Dokumen','Tanggal','Debit','Kredit'];data=[[docs[x.doc_id].number,x.date,float(x.debit),float(x.credit)] for x in js if system_code(am[x.account_id])==code]
  elif name=='assets':
@@ -1139,7 +1172,7 @@ def report(req:Request,name:str,format:str='html',start:str='',end:str='',accoun
    if y<45:p.showPage();y=800;p.setFont('Helvetica',8)
    p.drawString(35,y,' | '.join(str(v)[:30] for v in r)[:115]);y-=15
   p.save();out.seek(0);return StreamingResponse(out,media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="{name}.pdf"'})
- return page(req,s,'Laporan '+name,report_name=name,heads=heads,rows=data)
+ return page(req,s,{'stock':'Laporan Mutasi Stok Barang','valuation':'Laporan Valuasi Persediaan'}.get(name,'Laporan '+name),report_name=name,heads=heads,rows=data,report_start=start,report_end=end)
 @app.get('/settings-page')
 def settings_page(req:Request,s=Depends(db)):
  u=user(req,s);authorize(s,u,'read','settings');return page(req,s,'Pengaturan Tema',theme_settings=True)
