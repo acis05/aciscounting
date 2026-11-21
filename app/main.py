@@ -31,7 +31,7 @@ Base=declarative_base(); ph=PasswordHasher()
 class User(Base):
  __tablename__='users';id=Column(Integer,primary_key=True);email=Column(String(200),unique=True,nullable=False);name=Column(String(120));password=Column(String(300));company_id=Column(Integer,ForeignKey('companies.id'))
 class Company(Base):
- __tablename__='companies';id=Column(Integer,primary_key=True);name=Column(String(150),nullable=False);theme=Column(String(30),default='ocean');locked_through=Column(String(10),default='')
+ __tablename__='companies';id=Column(Integer,primary_key=True);name=Column(String(150),nullable=False);theme=Column(String(30),default='ocean');locked_through=Column(String(10),default='');cutoff_date=Column(String(10),default='')
 class Master(Base):
  __tablename__='masters';id=Column(Integer,primary_key=True);company_id=Column(Integer,index=True,nullable=False);kind=Column(String(25),nullable=False);code=Column(String(60),nullable=False);name=Column(String(180),nullable=False);extra=Column(Text,default='{}');active=Column(Boolean,default=True);__table_args__=(UniqueConstraint('company_id','kind','code'),)
 class Document(Base):
@@ -54,9 +54,11 @@ Base.metadata.create_all(engine)
 # Additive schema migration for PostgreSQL and SQLite; no existing columns removed.
 from sqlalchemy import inspect, text as sqltext
 with engine.begin() as connection:
+ if 'companies' in inspect(connection).get_table_names() and 'cutoff_date' not in {c['name'] for c in inspect(connection).get_columns('companies')}:
+  connection.execute(sqltext("ALTER TABLE companies ADD COLUMN cutoff_date VARCHAR(10) DEFAULT ''"))
  if 'print_templates' in inspect(connection).get_table_names() and 'settings' not in {c['name'] for c in inspect(connection).get_columns('print_templates')}:
   connection.execute(sqltext("ALTER TABLE print_templates ADD COLUMN settings TEXT DEFAULT '{}'"))
-app=FastAPI(title='aciscounting.id',version='1.3.0')
+app=FastAPI(title='aciscounting.id',version='1.5.0')
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('SECRET_KEY','DEV_ONLY_CHANGE_THIS_SECRET'),https_only=os.getenv('COOKIE_SECURE','false').lower()=='true',same_site='lax')
 ROOT=os.path.dirname(__file__);tplfilter=lambda v: json.loads(v or '{}');app.mount('/static',StaticFiles(directory=ROOT+'/static'),name='static');tpl=Jinja2Templates(directory=ROOT+'/templates');tpl.env.filters['from_json']=tplfilter
 @app.exception_handler(HTTPException)
@@ -102,7 +104,7 @@ def page(req,s,title,**ctx):
  except HTTPException:u=None
  c=s.get(Company,u.company_id) if u else None
  return tpl.TemplateResponse('app.html',{'request':req,'title':title,'user':u,'company':c,'cash':cash,'today':date.today().isoformat(),**ctx})
-ACCOUNTS=[('1000','Kas','cash'),('1010','Bank','bank'),('1100','Piutang Usaha','receivable'),('1200','Persediaan','asset'),('1500','Aset Tetap','asset'),('1590','Akumulasi Penyusutan','contra_asset'),('2000','Hutang Usaha','payable'),('3000','Modal','equity'),('4000','Penjualan','income'),('4010','Retur Penjualan','contra_income'),('5000','HPP','cogs'),('6000','Beban Operasional','expense'),('6100','Beban Penyusutan','expense'),('1201','Selisih Persediaan','expense'),('1150','PPN Masukan','asset'),('2100','PPN Keluaran','liability')]
+ACCOUNTS=[('1000','Kas','cash'),('1010','Bank','bank'),('1100','Piutang Usaha','receivable'),('1200','Persediaan','asset'),('1500','Aset Tetap','asset'),('1590','Akumulasi Penyusutan','contra_asset'),('2000','Hutang Usaha','payable'),('3000','Modal','equity'),('3090','Opening Balance Equity','equity'),('4000','Penjualan','income'),('4010','Retur Penjualan','contra_income'),('5000','HPP','cogs'),('6000','Beban Operasional','expense'),('6100','Beban Penyusutan','expense'),('1201','Selisih Persediaan','expense'),('1150','PPN Masukan','asset'),('2100','PPN Keluaran','liability')]
 def seed(s,cid):
  for code,name,typ in ACCOUNTS:s.add(Master(company_id=cid,kind='coa',code=code,name=name,extra=json.dumps({'type':typ,'system_code':code})))
  s.add(Master(company_id=cid,kind='warehouse',code='GD-01',name='Gudang Utama'))
@@ -181,6 +183,7 @@ def post(s,doc):
  if doc.status!='draft':raise HTTPException(400,'Hanya draft yang dapat diposting')
  ensure_system_coas(s,doc.company_id)
  c=owned(s,Company,doc.company_id,doc.company_id) if False else s.get(Company,doc.company_id)
+ if c.cutoff_date and doc.date<c.cutoff_date:raise HTTPException(400,'Tanggal transaksi sebelum tanggal mulai pakai aplikasi')
  if c.locked_through and doc.date<=c.locked_through:raise HTTPException(400,'Periode sudah dikunci')
  # Block backdated stock transactions to keep moving-average costs stable.
  if doc.kind in ('sale','purchase','sale_return','purchase_return','transfer','adjust'):
@@ -260,7 +263,8 @@ def post(s,doc):
      value=stockout(s,doc,iid,wh,quantity);cost_total+=value
      code=accounts['inventory_account'];inventory_lines[code]=inventory_lines.get(code,ZERO)+value
   amount=subtotal+tax
-  control=account_for(s,doc.company_id,p.get('control_account') or ('1100' if k.startswith('sale') else '2000'),('receivable',) if k.startswith('sale') else ('payable',)).code
+  cash_payment=bool(p.get('pay_cash')) and k in ('sale','purchase')
+  control=account_for(s,doc.company_id,p.get('cash_bank_account') or '1000',('cash','bank')).code if cash_payment else account_for(s,doc.company_id,p.get('control_account') or ('1100' if k.startswith('sale') else '2000'),('receivable',) if k.startswith('sale') else ('payable',)).code
   p['amount']=str(amount);p['subtotal']=str(subtotal);p['tax']=str(tax);doc.payload=json.dumps(p)
   if k=='purchase':
    E=[(code,val,0) for code,val in inventory_lines.items()]+[(code,val,0) for code,val in expense_lines.items()]+[('1150',tax,0),(control,0,amount)]
@@ -349,7 +353,9 @@ def home(req:Request,s=Depends(db)):
    change=net(j) if control_type=='receivable' else -net(j)
    credits[key]=credits.get(key,ZERO)+change
   for d in sorted(invoices,key=lambda d:(d.date,d.id)):
-   payload=json.loads(d.payload or '{}');control=payload.get('control_account') or ('1100' if kind=='sale' else '2000')
+   payload=json.loads(d.payload or '{}');
+   if payload.get('pay_cash'):continue
+   control=payload.get('control_account') or ('1100' if kind=='sale' else '2000')
    try:account_id=coa(s,cid,control)
    except HTTPException:continue
    key=(d.party_id,account_id);gross=dec(payload.get('amount',0));available=max(ZERO,credits.get(key,ZERO));used=min(gross,available)
@@ -498,7 +504,7 @@ def masters(req:Request,kind:str,s=Depends(db)):
  if kind not in MASTER_KINDS:raise HTTPException(404)
  if kind in ('coa','item'):ensure_system_coas(s,u.company_id);s.commit()
  items=s.query(Master).filter_by(company_id=u.company_id,kind=kind).order_by(Master.code).all()
- return page(req,s,MASTER_KINDS[kind],items=items,kind=kind,kind_label=MASTER_KINDS[kind],accounts=s.query(Master).filter_by(company_id=u.company_id,kind='coa').order_by(Master.code).all(),units=s.query(Master).filter_by(company_id=u.company_id,kind='unit').order_by(Master.name).all(),master_summary=master_summaries(s,u.company_id,kind,items))
+ return page(req,s,MASTER_KINDS[kind],items=items,kind=kind,kind_label=MASTER_KINDS[kind],accounts=s.query(Master).filter_by(company_id=u.company_id,kind='coa').order_by(Master.code).all(),opening_warehouses=s.query(Master).filter_by(company_id=u.company_id,kind='warehouse').all(),units=s.query(Master).filter_by(company_id=u.company_id,kind='unit').order_by(Master.name).all(),master_summary=master_summaries(s,u.company_id,kind,items))
 
 def master_summaries(s,cid,kind,items):
  result={x.id:{'balance':ZERO,'qty':ZERO} for x in items}
@@ -518,7 +524,64 @@ def master_detail(req:Request,kind:str,mid:int,s=Depends(db)):
  u=user(req,s);authorize(s,u,'read','masters')
  if kind not in MASTER_KINDS:raise HTTPException(404)
  x=master(s,u.company_id,kind,mid)
- return page(req,s,'Detail '+MASTER_KINDS[kind],kind=kind,kind_label=MASTER_KINDS[kind],detail_master=x,accounts=s.query(Master).filter_by(company_id=u.company_id,kind='coa').order_by(Master.code).all(),units=s.query(Master).filter_by(company_id=u.company_id,kind='unit').order_by(Master.name).all())
+ return page(req,s,'Detail '+MASTER_KINDS[kind],kind=kind,kind_label=MASTER_KINDS[kind],detail_master=x,accounts=s.query(Master).filter_by(company_id=u.company_id,kind='coa').order_by(Master.code).all(),opening_warehouses=s.query(Master).filter_by(company_id=u.company_id,kind='warehouse').all(),opening_values=opening_values(s,u.company_id,x),units=s.query(Master).filter_by(company_id=u.company_id,kind='unit').order_by(Master.name).all())
+
+def opening_values(s,cid,x):
+ d=s.query(Document).filter_by(company_id=cid,number=f'OPEN-{x.kind.upper()}-{x.id}').first()
+ if not d:return {'amount':'0','qty':'0','unit_cost':'0','warehouse_id':0}
+ p=json.loads(d.payload or '{}');return {'amount':p.get('amount','0'),'qty':p.get('qty','0'),'unit_cost':p.get('unit_cost','0'),'warehouse_id':d.warehouse_id or 0}
+
+def opening_balance(s,u,x,amount,qty=ZERO,unit_cost=ZERO,warehouse_id=0):
+ """One auditable opening document per master; replacement is atomic and blocks later stock moves."""
+ c=s.get(Company,u.company_id)
+ if not c.cutoff_date:raise HTTPException(400,'Atur Tanggal Mulai Pakai di Pengaturan terlebih dahulu')
+ if c.locked_through and c.cutoff_date<=c.locked_through:raise HTTPException(400,'Saldo awal berada dalam periode terkunci')
+ if x.kind=='coa' and account_type(x) in ('receivable','payable'):
+  if amount:raise HTTPException(400,'Saldo awal Piutang/Hutang harus melalui master pelanggan/pemasok')
+  return
+ if x.kind=='coa' and account_type(x) in ('income','contra_income','cogs','expense') and amount:
+  raise HTTPException(400,'Saldo awal pendapatan dan beban tidak diizinkan; gunakan akun neraca')
+ if x.kind=='item' and json.loads(x.extra or '{}').get('type','goods')!='goods':
+  if amount or qty:raise HTTPException(400,'Saldo awal stok hanya untuk barang, bukan jasa')
+  return
+ if amount<0:raise HTTPException(400,'Saldo awal tidak boleh negatif')
+ if x.kind=='item' and (qty<0 or unit_cost<0):raise HTTPException(400,'Stok awal dan harga pokok tidak boleh negatif')
+ if x.kind in ('customer','supplier') and amount<0:raise HTTPException(400,'Saldo awal pelanggan/pemasok tidak boleh negatif')
+ if x.kind=='item':amount=dec(qty*unit_cost)
+ number=f'OPEN-{x.kind.upper()}-{x.id}'
+ old=s.query(Document).filter_by(company_id=u.company_id,number=number).first()
+ if old:
+  if x.kind=='item':
+   later=s.query(Stock).filter(Stock.company_id==u.company_id,Stock.item_id==x.id,Stock.doc_id!=old.id).first()
+   if later:raise HTTPException(400,'Stok barang sudah bergerak; saldo awal tidak dapat diubah')
+  s.query(JournalParty).filter(JournalParty.journal_id.in_(s.query(Journal.id).filter_by(doc_id=old.id))).delete(synchronize_session=False)
+  s.query(Journal).filter_by(doc_id=old.id).delete()
+  s.query(Stock).filter_by(doc_id=old.id).delete()
+  s.delete(old);s.flush()
+ if not amount and not qty:return
+ if x.kind=='item' and not warehouse_id:raise HTTPException(400,'Pilih gudang untuk saldo awal barang')
+ doc=Document(company_id=u.company_id,kind='opening',number=number,date=c.cutoff_date,party_id=x.id if x.kind in ('customer','supplier') else None,warehouse_id=warehouse_id if x.kind=='item' else None,status='posted',memo=f'Saldo awal {x.kind}: {x.name}',payload=json.dumps({'master_id':x.id,'amount':str(amount),'qty':str(qty),'unit_cost':str(unit_cost)}))
+ s.add(doc);s.flush()
+ if x.kind=='coa':
+  if account_type(x)=='equity' and (x.code=='3090' or system_code(x)=='3090'):raise HTTPException(400,'Opening Balance Equity tidak dapat diisi saldo awal langsung')
+  account=x
+ elif x.kind=='customer':account=account_for(s,u.company_id,'1100',('receivable',))
+ elif x.kind=='supplier':account=account_for(s,u.company_id,'2000',('payable',))
+ else:
+  master(s,u.company_id,'warehouse',warehouse_id)
+  _,accts=item_accounts(s,u.company_id,x);account=account_for(s,u.company_id,accts['inventory_account'],('asset',))
+  move(s,doc,x.id,warehouse_id,qty,amount)
+ opening=account_for(s,u.company_id,'3090',('equity',))
+ typ=account_type(account)
+ credit_normal=typ in ('equity','liability','payable','contra_asset','contra_income')
+ primary_debit=ZERO if credit_normal else amount
+ primary_credit=amount if credit_normal else ZERO
+ for acc,dr,cr in ((account,primary_debit,primary_credit),(opening,primary_credit,primary_debit)):
+  if not dr and not cr:continue
+  j=Journal(company_id=u.company_id,doc_id=doc.id,date=doc.date,account_id=acc.id,debit=dr,credit=cr,memo=doc.memo);s.add(j);s.flush()
+  if acc.id==account.id and x.kind in ('customer','supplier'):
+   s.add(JournalParty(journal_id=j.id,company_id=u.company_id,party_id=x.id))
+ audit(s,u,'opening_balance',x.kind,x.id,str(amount))
 
 async def master_extra(req,kind):
  f=await req.form()
@@ -559,7 +622,11 @@ async def master_add(req:Request,kind:str,code:str=Form(...),name:str=Form(...),
  req.state.db=s;req.state.company_id=u.company_id
  data=await master_extra(req,kind)
  if s.query(Master).filter_by(company_id=u.company_id,kind=kind,code=code.strip()).first():raise HTTPException(400,'Kode sudah dipakai')
- x=Master(company_id=u.company_id,kind=kind,code=code.strip()[:60],name=name.strip()[:180],extra=json.dumps(data));s.add(x);s.flush();audit(s,u,'create',kind,x.id,x.code);s.commit();return go('/masters/'+kind)
+ x=Master(company_id=u.company_id,kind=kind,code=code.strip()[:60],name=name.strip()[:180],extra=json.dumps(data));s.add(x);s.flush()
+ f=await req.form()
+ if kind in ('coa','customer','supplier','item') and (dec(f.get('opening_balance') or 0) or dec(f.get('opening_qty') or 0)):
+  opening_balance(s,u,x,dec(f.get('opening_balance') or 0),dec(f.get('opening_qty') or 0),dec(f.get('opening_unit_cost') or 0),int(f.get('opening_warehouse') or 0))
+ audit(s,u,'create',kind,x.id,x.code);s.commit();return go('/masters/'+kind)
 @app.post('/masters/{kind}/{mid}/edit')
 async def master_edit(req:Request,kind:str,mid:int,code:str=Form(...),name:str=Form(...),extra:str=Form('{}'),s=Depends(db)):
  u=user(req,s);authorize(s,u,'write','masters');x=master(s,u.company_id,kind,mid)
@@ -574,7 +641,11 @@ async def master_edit(req:Request,kind:str,mid:int,code:str=Form(...),name:str=F
    data['system_code']=system
    # Account classification drives financial reports: do not silently change system account class.
    data['type']=SYSTEM_CODES[system][1]
- x.code=code.strip()[:60];x.name=name.strip()[:180];x.extra=json.dumps(data);audit(s,u,'edit',kind,x.id,x.code);s.commit();return go('/masters/'+kind)
+ x.code=code.strip()[:60];x.name=name.strip()[:180];x.extra=json.dumps(data)
+ f=await req.form()
+ if kind in ('coa','customer','supplier','item') and 'opening_balance' in f:
+  opening_balance(s,u,x,dec(f.get('opening_balance') or 0),dec(f.get('opening_qty') or 0),dec(f.get('opening_unit_cost') or 0),int(f.get('opening_warehouse') or 0))
+ audit(s,u,'edit',kind,x.id,x.code);s.commit();return go('/masters/'+kind)
 @app.post('/masters/{kind}/{mid}/delete')
 def master_delete(req:Request,kind:str,mid:int,s=Depends(db)):
  u=user(req,s);authorize(s,u,'write','masters');x=master(s,u.company_id,kind,mid)
@@ -600,6 +671,22 @@ def subledger(req:Request,account_id:int=0,party_id:int=0,s=Depends(db)):
  docs={x.id:x.number for x in s.query(Document).filter_by(company_id=u.company_id).all()}
  names={x.id:x.name for x in parties}
  return page(req,s,'Buku Besar Pembantu',subledger_accounts=accounts,subledger_parties=parties,subledger_rows=rows,subledger_names=names,subledger_docs=docs,selected_account=account_id,selected_party=party_id)
+@app.get('/settings/cutoff')
+def cutoff_settings(req:Request,s=Depends(db)):
+ u=user(req,s);authorize(s,u,'manage','settings')
+ return page(req,s,'Tanggal Mulai Pakai',cutoff_settings=True)
+@app.post('/settings/cutoff')
+async def save_cutoff(req:Request,s=Depends(db)):
+ u=user(req,s);authorize(s,u,'manage','settings');f=await req.form()
+ value=str(f.get('cutoff_date') or '')
+ try:date.fromisoformat(value)
+ except ValueError:raise HTTPException(400,'Tanggal mulai pakai tidak valid')
+ c=s.get(Company,u.company_id)
+ if c.cutoff_date and c.cutoff_date!=value:
+  if s.query(Document).filter_by(company_id=u.company_id,status='posted').first():raise HTTPException(400,'Tanggal mulai pakai tidak dapat diganti setelah ada transaksi posting atau saldo awal')
+ if not c.cutoff_date and s.query(Document).filter(Document.company_id==u.company_id,Document.status=='posted',Document.date<value).first():raise HTTPException(400,'Ada transaksi posting sebelum tanggal tersebut; tanggal mulai pakai harus sebelum atau sama dengan tanggal transaksi tertua')
+ c.cutoff_date=value;audit(s,u,'update','cutoff',c.id,value);s.commit();return go('/settings/cutoff')
+
 @app.get('/print-design')
 def print_design(req:Request,s=Depends(db)):
  u=user(req,s);authorize(s,u,'manage','print')
@@ -712,7 +799,8 @@ async def form_payload(req,s,cid,kind):
    master(s,cid,'item',int(iid))
    rows.append({'item_id':int(iid),'qty':str(qty),'price':str(price),'tax_rate':str(rate),'discount':str(discount)})
   if not rows:raise HTTPException(400,'Tambahkan minimal satu barang/jasa')
-  p={'items':rows,'control_account':(form.get('control_account') or ('1100' if kind.startswith('sale') else '2000')),'invoice_discount':str(form.get('invoice_discount') or '0'),'due_date':str(form.get('due_date') or ''),'salesman_id':int(form.get('salesman_id') or 0) if kind=='sale' else 0}
+  p={'items':rows,'control_account':(form.get('control_account') or ('1100' if kind.startswith('sale') else '2000')),'invoice_discount':str(form.get('invoice_discount') or '0'),'due_date':str(form.get('due_date') or ''),'salesman_id':int(form.get('salesman_id') or 0) if kind=='sale' else 0,'pay_cash':bool(form.get('pay_cash')),'cash_bank_account':str(form.get('cash_bank_account') or '')}
+  if kind in ('sale','purchase') and p['pay_cash']:account_for(s,cid,p['cash_bank_account'],('cash','bank'))
   if kind=='sale' and p['salesman_id']:master(s,cid,'salesman',p['salesman_id'])
   if kind.endswith('return'):p['source_id']=int(form.get('source_id') or 0)
   return p
